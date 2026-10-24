@@ -1,0 +1,9 @@
+env/
+__pycache__/
+*.egg-info/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+calibrate.png
+debug/
+runs/
