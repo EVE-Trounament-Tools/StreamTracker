@@ -70,7 +70,7 @@ def iso(t: datetime) -> str:
 class Slot:
     side: str
     slot: int
-    pts: Counter = field(default_factory=Counter)
+    pts: Counter = field(default_factory=Counter)  # PTS as read off the HUD; never derived from ship_points.csv
     seen_alive: bool = False
     dead_streak: int = 0
     first_dead: FrameTime | None = None
@@ -114,6 +114,7 @@ class MatchState:
     ended: bool = False
     end_reason: str | None = None
     series_id: int | None = None
+    written_teams: dict[str, str | None] = field(default_factory=dict)  # provisional names in the DB
 
 
 def team_strip(frame: np.ndarray) -> np.ndarray:
@@ -289,6 +290,7 @@ class Tracker:
             if m.live_started:
                 self._end(m.last_hud, "hud_lost")
             elif not self._discard_if_brief(m):
+                self._finish_identity(m)  # record the teams (and their colours) anyway
                 self.db.update_match(m.id, status="abandoned")
                 if m.series_id is not None:
                     self.db.refresh_series(m.series_id)
@@ -601,14 +603,11 @@ class Tracker:
             m.votes.setdefault(key, Counter())[value] += 1
 
         for side in SIDES:
-            vote(("team", side), ident.teams[side])
-            raws = tuple(ident.bans[side])
-            hits = [self.vocab.match(raw).ship for raw in raws]
-            if any(hits) or not raws:
-                names = tuple(h.name if h else UNMATCHED + raw for h, raw in zip(hits, raws))
-                vote(("bans", side), names)
-                m.raw[("bans", side, names)] = raws
-            vote(("bans_raw", side), tuple(ident.bans[side]))
+            if ident.teams[side].strip():
+                vote(("team", side), ident.teams[side])
+            # On a faded HUD the ban count is unknown, and an empty list means nothing.
+            if ident.ban_count.get(side) is not None:
+                self._vote_bans(m, side, ident.bans[side], vote)
             for i, (raw, pilot) in enumerate(zip(ident.ships[side], ident.pilots[side])):
                 slot = m.slots.get((side, i))
                 hit = self.vocab.match(raw, slot.points if slot else None)
@@ -617,12 +616,35 @@ class Tracker:
                     m.raw[("ship", side, i, hit.ship.name)] = (raw, hit.score)
                 vote(("ship_raw", side, i), raw)
                 vote(("pilot", side, i), pilot)
+        self._write_teams(m)
         required = [("team", s) for s in SIDES] + [("bans", s) for s in SIDES]
         required += [("ship", side, i) for side, i in m.slots]
         settled = all(key in m.votes and m.votes[key].most_common(1)[0][1] >= IDENTITY_VOTES
                       for key in required)
         if settled or m.identity_reads >= IDENTITY_MAX_READS:
             self._settle_identity(m)
+
+    def _vote_bans(self, m: MatchState, side: str, bans: list[str], vote) -> None:
+        """Vote the ban list top-down as one tuple, so the stored ordinals
+        follow the order shown on stream. No bans at all is a valid list."""
+        raws = tuple(bans)
+        hits = [self.vocab.match(raw).ship for raw in raws]
+        if any(hits) or not raws:
+            names = tuple(h.name if h else UNMATCHED + raw for h, raw in zip(hits, raws))
+            vote(("bans", side), names)
+            m.raw[("bans", side, names)] = raws
+        vote(("bans_raw", side), raws)
+
+    def _write_teams(self, m: MatchState) -> None:
+        """Store the leading team name for each colour as soon as there is
+        one, so a match that never settles still records who was red/blue."""
+        teams = {}
+        for side in SIDES:
+            c = m.votes.get(("team", side))
+            teams[side] = self.teams.snap(c.most_common(1)[0][0]) if c else None
+        if teams != m.written_teams:
+            m.written_teams = teams
+            self.db.update_match(m.id, red_team=teams["red"], blue_team=teams["blue"])
 
     def _settle_identity(self, m: MatchState) -> None:
         m.identity_settled = True

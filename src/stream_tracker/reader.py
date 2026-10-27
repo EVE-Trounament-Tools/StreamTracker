@@ -40,6 +40,7 @@ class FrameReading:
     tidi: bool = False  # clock is the red TiDi game clock
     scores: dict[str, int | None] = field(default_factory=dict)
     rows: dict[str, list[RowState]] = field(default_factory=dict)
+    # Sides missing here had the HUD too faded to count bans; 0 is a real count.
     ban_count: dict[str, int] = field(default_factory=dict)
 
 
@@ -49,6 +50,7 @@ class Identity:
     bans: dict[str, list[str]]
     ships: dict[str, list[str]]  # raw ship text per slot
     pilots: dict[str, list[str]]
+    ban_count: dict[str, int | None]  # None: HUD too faded to tell how many bans
 
 
 def _p99(region: np.ndarray) -> float:
@@ -100,9 +102,12 @@ def read_frame(frame: np.ndarray) -> FrameReading:
         "blue": _int(glyphs.read(L.crop(frame, L.BLUE_SCORE), "header", DIGITS)),
     }
     rows = {}
+    bans = {}
     for side in SIDES:
         rows[side] = []
         level = headings_level(frame, side)
+        if level >= HEADINGS_MIN:
+            bans[side] = ban_count(frame, side)
         for i in range(L.MAX_ROWS):
             status = row_status(frame, side, i, level)
             pts = None
@@ -117,7 +122,7 @@ def read_frame(frame: np.ndarray) -> FrameReading:
         tidi=tidi,
         scores=scores,
         rows=rows,
-        ban_count={s: ban_count(frame, s) for s in SIDES},
+        ban_count=bans,
     )
 
 
@@ -166,4 +171,5 @@ def read_identity(frame: np.ndarray, reading: FrameReading) -> Identity:
         bans={s: collect("ban", s) for s in SIDES},
         ships={s: collect("ship", s) for s in SIDES},
         pilots={s: collect("pilot", s) for s in SIDES},
+        ban_count={s: reading.ban_count.get(s) for s in SIDES},
     )

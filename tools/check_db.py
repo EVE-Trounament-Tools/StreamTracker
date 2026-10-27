@@ -46,8 +46,9 @@ def check(path: str, issues: list, teams: set) -> list[dict]:
             flag(m, f"end_reason {m['end_reason']}")
         if m["joined_late"]:
             flag(m, "joined late")
-        if not m["red_team"] or not m["blue_team"]:
-            flag(m, "missing team name")
+        for side in ("red", "blue"):
+            if not (m[f"{side}_team"] or "").strip():
+                flag(m, f"missing {side} team name")
 
         live, end = ts(m["live_start_utc"]), ts(m["ended_utc"])
         if live and end:
@@ -102,6 +103,9 @@ def check(path: str, issues: list, teams: set) -> list[dict]:
             side_bans = [b for b in bans if b["side"] == side]
             if not side_bans:
                 flag(m, f"note: no {side} bans (check the VOD; teams may ban nothing)")
+            ordinals = sorted(b["ordinal"] for b in side_bans)
+            if ordinals != list(range(1, len(side_bans) + 1)):
+                flag(m, f"{side} ban ordinals {ordinals} aren't 1..{len(side_bans)}")
             for b in side_bans:
                 if not b["ship_type"]:
                     flag(m, f"{side} ban {b['ship_raw']!r} not in list")
