@@ -6,9 +6,11 @@ import pytest
 
 import numpy as np
 
+from stream_tracker import reader
 from stream_tracker.db import Database
 from stream_tracker.reader import Identity
-from stream_tracker.tracker import FrameTime, MatchState, Tracker
+from stream_tracker.tracker import MIN_MATCH_HUD_FRAMES, FrameTime, MatchState, Tracker
+from stream_tracker.vocab import ShipVocab, load_ships
 
 T0 = datetime(2026, 10, 18, 15, 0, tzinfo=timezone.utc)
 
@@ -55,6 +57,9 @@ def test_match_lifecycle(frame, tmp_path):
     assert first_seen["died_match_s"] == 600 - 246  # first seen dead at 4:06
     bans = rows(db_path, "SELECT ship_type FROM bans WHERE side='red' ORDER BY ordinal")
     assert [b["ship_type"] for b in bans] == ["Zarmazd", "Ashimmu", "Curse"]
+    # Points are the PTS column read off the stream.
+    read = reader.read_frame(frame(1000)).rows
+    assert all(s["points"] == read[s["side"]][s["slot"]].pts for s in ships)
 
 
 def test_joined_late(frame, tmp_path):
@@ -161,12 +166,91 @@ def test_unknown_ban_keeps_the_others(tmp_path):
         teams={"red": "THE TUSKERS CO.", "blue": "META RELOADED"},
         bans={"red": ["Zarmazd", "Raven Navy Issue", "Cenotaph"], "blue": ["Eos", "Dominix"]},
         ships={"red": [], "blue": []}, pilots={"red": [], "blue": []},
+        ban_count={"red": 3, "blue": 2},
     )
     garbage = Identity(teams=good.teams, bans={"red": ["Zarmazd", "xq#v", "~~"], "blue": good.bans["blue"]},
-                       ships=good.ships, pilots=good.pilots)
+                       ships=good.ships, pilots=good.pilots, ban_count=good.ban_count)
     for ident in (good, garbage, good, good):
         tracker._vote(m, ident)
     assert m.identity_settled
     bans = rows(db_path, "SELECT ship_raw, ship_type FROM bans WHERE side='red' ORDER BY ordinal")
     assert [(b["ship_raw"], b["ship_type"]) for b in bans] == [
         ("Zarmazd", "Zarmazd"), ("Raven Navy Issue", "Raven Navy Issue"), ("Cenotaph", None)]
+
+
+def _identity(red="THE TUSKERS CO.", blue="META RELOADED", red_bans=("Zarmazd", "Eos"), blue_bans=(),
+              ban_count=None):
+    counts = ban_count or {"red": len(red_bans), "blue": len(blue_bans)}
+    return Identity(teams={"red": red, "blue": blue}, bans={"red": list(red_bans), "blue": list(blue_bans)},
+                    ships={"red": [], "blue": []}, pilots={"red": [], "blue": []}, ban_count=counts)
+
+
+def _hand_match(tmp_path):
+    db_path = tmp_path / "t.sqlite"
+    db = Database(db_path)
+    tracker = Tracker(db)
+    m = MatchState(id=db.create_match(None, None, T0.isoformat()), team_crops=np.zeros((1, 1), np.float32))
+    return db_path, tracker, m
+
+
+def test_zero_bans_is_a_valid_list(tmp_path):
+    db_path, tracker, m = _hand_match(tmp_path)
+    for _ in range(3):
+        tracker._vote(m, _identity())
+    assert m.identity_settled
+    assert rows(db_path, "SELECT * FROM bans WHERE side='blue'") == []
+    bans = rows(db_path, "SELECT ship_type FROM bans WHERE side='red' ORDER BY ordinal")
+    assert [b["ship_type"] for b in bans] == ["Zarmazd", "Eos"]
+
+
+def test_faded_hud_doesnt_wipe_bans(tmp_path):
+    """A faded HUD can't count bans; its empty lists mustn't outvote the real ones."""
+    db_path, tracker, m = _hand_match(tmp_path)
+    faded = _identity(red_bans=(), ban_count={"red": None, "blue": None})
+    good = _identity(red_bans=("Curse", "Zarmazd", "Ashimmu"))
+    for ident in (faded, faded, faded, good, faded, good, good):
+        tracker._vote(m, ident)
+    assert m.identity_settled
+    bans = rows(db_path, "SELECT ordinal, ship_type FROM bans WHERE side='red' ORDER BY ordinal")
+    assert [(b["ordinal"], b["ship_type"]) for b in bans] == [(1, "Curse"), (2, "Zarmazd"), (3, "Ashimmu")]
+
+
+def test_team_colours_recorded_before_settling(tmp_path):
+    db_path, tracker, m = _hand_match(tmp_path)
+    tracker._vote(m, _identity(red="", blue=""))
+    tracker._vote(m, _identity(red="SEDITION.", blue=" "))
+    assert not m.identity_settled
+    (row,) = rows(db_path, "SELECT red_team, blue_team FROM matches")
+    assert (row["red_team"], row["blue_team"]) == ("SEDITION.", None)
+    for _ in range(3):
+        tracker._vote(m, _identity(red="SEDITION.", blue="NEON NIGHTMARES"))
+    assert m.identity_settled
+    (row,) = rows(db_path, "SELECT red_team, blue_team FROM matches")
+    assert (row["red_team"], row["blue_team"]) == ("SEDITION.", "NEON NIGHTMARES")
+
+
+def test_abandoned_match_keeps_team_colours(tmp_path):
+    db_path, tracker, m = _hand_match(tmp_path)
+    tracker.match = m
+    m.hud_frames = MIN_MATCH_HUD_FRAMES
+    m.last_hud = FrameTime(T0, 0)
+    tracker._vote(m, _identity(red="SEDITION.", blue="NEON NIGHTMARES"))
+    later = tracker.grace_s + 1
+    tracker._on_no_hud(FrameTime(T0 + timedelta(seconds=later), later))
+    (row,) = rows(db_path, "SELECT * FROM matches")
+    assert row["status"] == "abandoned"
+    assert (row["red_team"], row["blue_team"]) == ("SEDITION.", "NEON NIGHTMARES")
+
+
+def test_points_not_taken_from_ship_list(frame, tmp_path):
+    """Stored points come from the HUD even if the ship list disagrees."""
+    from dataclasses import replace
+
+    db_path = tmp_path / "t.sqlite"
+    bogus = ShipVocab([replace(s, points=999) for s in load_ships()])
+    tracker = Tracker(Database(db_path), vocab=bogus)
+    feed(tracker, [(1000 + i, frame(1000)) for i in range(6)])
+    tracker.close()
+    read = reader.read_frame(frame(1000)).rows
+    ships = rows(db_path, "SELECT * FROM ships")
+    assert ships and all(s["points"] == read[s["side"]][s["slot"]].pts != 999 for s in ships)

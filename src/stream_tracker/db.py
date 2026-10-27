@@ -66,7 +66,7 @@ CREATE TABLE IF NOT EXISTS ships (
     ship_type TEXT,
     match_confidence REAL,      -- fuzzy score of ship_raw -> ship_type
     pilot TEXT,
-    points INTEGER,
+    points INTEGER,             -- PTS as read off the HUD (never from ship_points.csv)
     died_match_s INTEGER,       -- real seconds since the match went live
     died_clock_s INTEGER,       -- clock the HUD showed (remaining seconds)
     died_in_tidi INTEGER,       -- 1 if that was the red TiDi game clock
