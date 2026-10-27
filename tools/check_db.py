@@ -111,12 +111,26 @@ def check(path: str, issues: list, teams: set) -> list[dict]:
                 flag(m, f"{s['side']} flew banned {s['ship_type']}")
 
     for pair, ms in seen_pairs.items():
-        if len(ms) > 1:
+        if len(ms) > 1 and None not in pair:
             ids = [m["id"] for m in ms]
-            # Separate countdowns and complete results: a rematch (e.g. a finals series).
-            rematch = all(m["countdown_start_utc"] and m["end_reason"] in ("time", "wipe") for m in ms)
-            label = "note: rematch, " if rematch else ""
-            issues.append(f"{db}: {label}{' vs '.join(sorted(t or '?' for t in pair))} appears in matches {ids}")
+            names = " vs ".join(sorted(pair))
+            series = {m.get("series_id") for m in ms}
+            loose = [m["id"] for m in ms if m.get("series_id") is None]
+            if loose:
+                issues.append(f"{db}: {names} appears in matches {ids}; {loose} in no series"
+                              " (stale team names? pilots differ)")
+            for sid in sorted(series - {None}):
+                games = [m["id"] for m in ms if m.get("series_id") == sid]
+                if len(games) > 1:
+                    issues.append(f"{db}: note: series {names}, matches {games}")
+
+    has_series = conn.execute("SELECT 1 FROM sqlite_master WHERE name='series'").fetchone()
+    for s in conn.execute("SELECT * FROM series") if has_series else ():
+        games = [m["series_game"] for m in matches if m.get("series_id") == s["id"]]
+        if sorted(games) != list(range(1, len(games) + 1)) or len(games) != s["games"]:
+            issues.append(f"{db} series {s['id']}: game numbers {sorted(games)} for {s['games']} games")
+        if max(s["team_a_wins"], s["team_b_wins"]) > 3:
+            issues.append(f"{db} series {s['id']}: {s['team_a_wins']}-{s['team_b_wins']}, longer than a Bo5")
     return matches
 
 

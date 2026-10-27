@@ -29,6 +29,9 @@ env/bin/stream-tracker replay match.mp4 --start 1:40:00 --start-utc 2026-10-18T1
 # check the HUD regions against a 1080p screenshot (e.g. if the overlay changes)
 env/bin/stream-tracker calibrate frame.png --out calibrate.png [--save-anchors]
 
+# group matches in older databases into series
+env/bin/stream-tracker series runs/*.sqlite
+
 # refresh the ship list/points from the AT points sheet
 env/bin/stream-tracker update-ships
 ```
@@ -70,10 +73,20 @@ Death times:
 - **Pilot names spilling into the PTS column.**
 - **In-game labels showing just above the timer.**
 
+**Final scores** are taken as 200 minus the opponent's surviving points whenever every roster PTS was read, since the score digits can stop reading cleanly on a soft encode (AT XXI day 3 on YouTube). A disagreement with the last score read is logged as a `score_mismatch` event.
+
+**Bans** not in the ship list (e.g. Cenotaph in AT XXI) are kept as raw text with `ship_type = NULL`; the rest of that side's bans still resolve.
+
 `death_confidence` is one of:
 - `high`: the opponent's score equals 200 minus this side's surviving points (how AT scoring works). A side that brings under 200 points hands its opponent a head start, e.g. a 199-point roster means the opponent starts on 1.
 - `low`: the score doesn't match yet. It is upgraded once it does.
 - `unknown_time`: the ship was already dead when tracking started, e.g. when joining mid-match.
+
+**Series (Bo3/Bo5):** a match whose team pairing was already played counts as the next game of that series, even with other matches played in between and with the teams on swapped sides. It is linked as soon as the names are read, before the countdown ends, and the series score (`series.team_a_wins`/`team_b_wins`) updates when each game ends. A repeat only joins the series if:
+- the series' last game was within 6 hours, and neither team has played anyone else since; otherwise it starts a new series (e.g. a group-stage game and a later final between the same teams);
+- each team fields at least 3 of the same pilots as an earlier game. If not, the overlay was probably still showing the previous match's team names (seen once in AT XXII), so the match stays out of the series and a `series_mismatch` event is logged.
+
+`matches.series_id` and `series_game` give each match's place in its series. `stream-tracker series DB...` adds series to databases recorded before this existed.
 
 Team names are snapped to `data/teams.txt` (the AT XXII teams) and to names already in the database when they are ≥88% similar, which fixes OCR slips and overlay typos.
 

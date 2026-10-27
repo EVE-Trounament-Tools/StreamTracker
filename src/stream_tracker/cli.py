@@ -106,6 +106,23 @@ def cmd_calibrate(args) -> None:
         print("reading:", r)
 
 
+def cmd_series(args) -> None:
+    """Group existing matches into series (for databases from before series tracking)."""
+    for path in args.db:
+        db = Database(path)
+        ids = [r["id"] for r in db.conn.execute("SELECT id FROM matches ORDER BY created_utc, id")]
+        for mid in ids:
+            sid, mismatch = db.assign_series(mid)
+            if mismatch:
+                print(f"{path}: match {mid} repeats a recent pairing with other pilots; left out")
+        for s in db.conn.execute("SELECT * FROM series WHERE games > 1 ORDER BY first_utc"):
+            print(f"{path}: {s['team_a']} {s['team_a_wins']}-{s['team_b_wins']} {s['team_b']}"
+                  f" ({s['games']} games)")
+        n = db.conn.execute("SELECT count(*) FROM series").fetchone()[0]
+        print(f"{path}: {len(ids)} matches, {n} series")
+        db.close()
+
+
 def cmd_update_ships(args) -> None:
     print(f"wrote {update_ship_csv()} ships")
 
@@ -144,6 +161,10 @@ def main(argv=None) -> None:
     p.add_argument("--save-anchors", action="store_true",
                    help="use this frame as the HUD-present reference")
     p.set_defaults(func=cmd_calibrate)
+
+    p = sub.add_parser("series", help="group the matches in existing databases into series")
+    p.add_argument("db", nargs="+")
+    p.set_defaults(func=cmd_series)
 
     p = sub.add_parser("update-ships", help="refresh data/ship_points.csv from the AT points sheet")
     p.set_defaults(func=cmd_update_ships)

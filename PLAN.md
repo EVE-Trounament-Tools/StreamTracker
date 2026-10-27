@@ -132,3 +132,4 @@ Optional `--debug-dir`: save PNG of frame at each state change/death for manual 
   - Caster graphics get drawn over the overlay.
   - Short ship names ("Naga") return nothing from tesseract in line mode.
   - No team made more than 3 bans in AT XXII.
+- **Series (Bo3/Bo5).** Matches repeating a team pairing are linked into a `series` row (`matches.series_id`, `series_game`). The link is made when identity settles, and wins are recomputed at each match end, reopen or abandon. A repeat has to come within 6h of the series' last game, and each team must share ≥3 pilots with an earlier game. That pilot check exists because on day 6 (2873111426, m4/m5) the overlay kept CRITICAL. MASS. vs THE SKELETON CREW for a match between two other teams.
