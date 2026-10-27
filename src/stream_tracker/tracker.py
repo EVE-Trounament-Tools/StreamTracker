@@ -42,6 +42,7 @@ ZERO_HOLD_FRAMES = 10
 LIVE_CONFIRM_FRAMES = 2  # running-clock readings before the 10:00 timer counts as started
 IDENTITY_VOTES = 3  # agreeing reads before a name is settled
 IDENTITY_MAX_READS = 20
+UNMATCHED = "?"  # prefixes raw ban text that isn't in the ship list, in votes
 # Replays run far faster than 1 fps; wait for a pending name read once this
 # many frames have gone by so names still get several reads per match.
 IDENTITY_MAX_LAG_FRAMES = 5
@@ -112,6 +113,7 @@ class MatchState:
     last_scores: dict[str, int | None] = field(default_factory=dict)
     ended: bool = False
     end_reason: str | None = None
+    series_id: int | None = None
 
 
 def team_strip(frame: np.ndarray) -> np.ndarray:
@@ -288,6 +290,8 @@ class Tracker:
                 self._end(m.last_hud, "hud_lost")
             elif not self._discard_if_brief(m):
                 self.db.update_match(m.id, status="abandoned")
+                if m.series_id is not None:
+                    self.db.refresh_series(m.series_id)
                 self._event(t, "abandoned")
                 self.match = None
 
@@ -322,6 +326,8 @@ class Tracker:
         if m.identity_reads < IDENTITY_MAX_READS:
             m.identity_settled = False  # keep voting; names settled early on few reads
         self.db.update_match(m.id, status="live", ended_utc=None, end_reason=None)
+        if m.series_id is not None:
+            self.db.refresh_series(m.series_id)  # its result no longer counts
         self._event(t, "match_reopened")
 
     def _end(self, t: FrameTime, reason: str) -> None:
@@ -332,7 +338,17 @@ class Tracker:
         m.ended = True
         m.end_reason = reason
         self._finished_teams = m.team_crops
-        scores = m.last_scores
+        scores = dict(m.last_scores)
+        for side in SIDES:
+            # A score is 200 minus the opponent's surviving points. Prefer that
+            # to the last score read: on a soft encode the score digits can
+            # stop reading cleanly well before the end (AT XXI day 3 on YouTube).
+            other = [s for s in m.slots.values() if s.side != side]
+            if other and all(s.points is not None for s in other):
+                derived = TEAM_POINTS - sum(s.points for s in other if not s.dead)
+                if scores.get(side) != derived:
+                    self._event(t, "score_mismatch", {"side": side, "read": scores.get(side), "derived": derived})
+                scores[side] = derived
         overtime = None
         if m.tidi_start is not None:
             overtime = round(t.offset - m.tidi_start.offset)
@@ -347,6 +363,13 @@ class Tracker:
         )
         self._event(t, "match_ended", {"reason": reason, "scores": scores})
         log.info("match %d ended (%s) %s", m.id, reason, scores)
+        if m.series_id is not None:
+            self.db.refresh_series(m.series_id)
+            series = self.db.series_summary(m.id)
+            if series:
+                self._event(t, "series_updated", series)
+                log.info("match %d: series %d game %d, %s", m.id, series["series_id"],
+                         series["game"], series["wins"])
 
     # ------------------------------------------------------------------- phase
 
@@ -567,8 +590,11 @@ class Tracker:
             self._settle_identity(m)
 
     def _vote(self, m: MatchState, ident: Identity) -> None:
-        """Count one read. Ship and ban reads only vote when they resolve to the
-        ship list, so reads through caster graphics drawn over the HUD drop out."""
+        """Count one read. Ship reads only vote when they resolve to the ship
+        list, so reads through caster graphics drawn over the HUD drop out. A
+        ban list votes with any name it can't resolve kept as raw text (a ship
+        missing from the list, e.g. one from another year), which garbage reads
+        won't agree on."""
         m.identity_reads += 1
 
         def vote(key, value):
@@ -576,10 +602,12 @@ class Tracker:
 
         for side in SIDES:
             vote(("team", side), ident.teams[side])
-            bans = tuple(self.vocab.match(raw).ship for raw in ident.bans[side])
-            if all(bans):
-                vote(("bans", side), tuple(b.name for b in bans))
-                m.raw[("bans", side)] = tuple(ident.bans[side])
+            raws = tuple(ident.bans[side])
+            hits = [self.vocab.match(raw).ship for raw in raws]
+            if any(hits) or not raws:
+                names = tuple(h.name if h else UNMATCHED + raw for h, raw in zip(hits, raws))
+                vote(("bans", side), names)
+                m.raw[("bans", side, names)] = raws
             vote(("bans_raw", side), tuple(ident.bans[side]))
             for i, (raw, pilot) in enumerate(zip(ident.ships[side], ident.pilots[side])):
                 slot = m.slots.get((side, i))
@@ -610,7 +638,8 @@ class Tracker:
         for side in SIDES:
             names = best(("bans", side))
             if names is not None:
-                bans = list(zip(m.raw[("bans", side)], names))
+                bans = [(raw, None if name.startswith(UNMATCHED) else name)
+                        for raw, name in zip(m.raw[("bans", side, names)], names)]
             else:
                 bans = [(raw, None) for raw in best(("bans_raw", side)) or ()]
             self.db.set_bans(m.id, side, bans)
@@ -627,8 +656,19 @@ class Tracker:
                 )
         log.info("match %d identity: %s vs %s", m.id, teams["red"], teams["blue"])
         t = self._t
-        self.db.log_event(m.id, iso(t.utc) if t else iso(datetime.now().astimezone()),
-                          t.offset if t else None, "identity_settled", {"reads": m.identity_reads})
+        ts, offset = (iso(t.utc), t.offset) if t else (iso(datetime.now().astimezone()), None)
+        self.db.log_event(m.id, ts, offset, "identity_settled", {"reads": m.identity_reads})
+        # Repeat pairings are games of one series (Bo3/Bo5), even with other
+        # matches played in between.
+        m.series_id, mismatch = self.db.assign_series(m.id)
+        if mismatch:
+            log.warning("match %d: %s vs %s played recently with other pilots; not joined to that series",
+                        m.id, teams["red"], teams["blue"])
+            self.db.log_event(m.id, ts, offset, "series_mismatch", None)
+        elif m.series_id is not None:
+            series = self.db.series_summary(m.id)
+            log.info("match %d: series %d game %d", m.id, m.series_id, series["game"])
+            self.db.log_event(m.id, ts, offset, "series", series)
 
     # ------------------------------------------------------------------- utils
 

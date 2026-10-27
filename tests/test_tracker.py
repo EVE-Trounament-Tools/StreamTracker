@@ -4,8 +4,11 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+import numpy as np
+
 from stream_tracker.db import Database
-from stream_tracker.tracker import FrameTime, Tracker
+from stream_tracker.reader import Identity
+from stream_tracker.tracker import FrameTime, MatchState, Tracker
 
 T0 = datetime(2026, 10, 18, 15, 0, tzinfo=timezone.utc)
 
@@ -38,6 +41,7 @@ def test_match_lifecycle(frame, tmp_path):
     (m,) = rows(db_path, "SELECT * FROM matches")
     assert m["status"] == "complete" and m["end_reason"] == "time"
     assert (m["red_team"], m["blue_team"]) == ("NEON NIGHTMARES", "SEDITION.")
+    assert m["series_id"] is not None and m["series_game"] == 1
     assert (m["red_score"], m["blue_score"]) == (114, 128)
     assert m["joined_late"] == 0
     assert m["countdown_start_utc"] == "2026-10-18T15:10:16+00:00"
@@ -144,3 +148,25 @@ def test_reference_vod(tmp_path):
     deaths = rows(db_path, f"SELECT * FROM ships WHERE match_id={m2['id']} AND died_utc IS NOT NULL")
     assert len(deaths) == 12
     assert all(d["death_confidence"] == "high" for d in deaths)
+
+
+def test_unknown_ban_keeps_the_others(tmp_path):
+    """AT XXI bans included Cenotaph, which isn't in the AT XXII ship list.
+    The other bans on that side must still resolve."""
+    db_path = tmp_path / "t.sqlite"
+    db = Database(db_path)
+    tracker = Tracker(db)
+    m = MatchState(id=db.create_match(None, None, T0.isoformat()), team_crops=np.zeros((1, 1), np.float32))
+    good = Identity(
+        teams={"red": "THE TUSKERS CO.", "blue": "META RELOADED"},
+        bans={"red": ["Zarmazd", "Raven Navy Issue", "Cenotaph"], "blue": ["Eos", "Dominix"]},
+        ships={"red": [], "blue": []}, pilots={"red": [], "blue": []},
+    )
+    garbage = Identity(teams=good.teams, bans={"red": ["Zarmazd", "xq#v", "~~"], "blue": good.bans["blue"]},
+                       ships=good.ships, pilots=good.pilots)
+    for ident in (good, garbage, good, good):
+        tracker._vote(m, ident)
+    assert m.identity_settled
+    bans = rows(db_path, "SELECT ship_raw, ship_type FROM bans WHERE side='red' ORDER BY ordinal")
+    assert [(b["ship_raw"], b["ship_type"]) for b in bans] == [
+        ("Zarmazd", "Zarmazd"), ("Raven Navy Issue", "Raven Navy Issue"), ("Cenotaph", None)]

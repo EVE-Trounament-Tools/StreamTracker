@@ -109,15 +109,25 @@ def end_badge(m):
         out += ' <span class="badge warn">incomplete</span>'
     if m["tidi_overtime_s"]:
         out += f' <span class="badge warn">TiDi +{mmss(m["tidi_overtime_s"])}</span>'
+    s = m.get("series")
+    if s and s["games"] > 1:
+        wins = {s["team_a"]: s["team_a_wins"], s["team_b"]: s["team_b_wins"]}
+        score = f'{wins.get(m["red_team"], 0)}–{wins.get(m["blue_team"], 0)}'
+        out += (f' <span class="badge" title="series score, red–blue">'
+                f'game {m["series_game"]}/{s["games"]} · {score}</span>')
     return out
 
 
 def load_day(path):
     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
+    series = {}
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE name='series'").fetchone():
+        series = {s["id"]: dict(s) for s in conn.execute("SELECT * FROM series")}
     matches = []
     for m in conn.execute("SELECT * FROM matches ORDER BY live_start_utc, id"):
         m = dict(m)
+        m["series"] = series.get(m.get("series_id"))
         m["ships"] = [dict(s) for s in conn.execute(
             "SELECT * FROM ships WHERE match_id=? ORDER BY side DESC, slot", (m["id"],))]
         m["bans"] = [dict(b) for b in conn.execute(
