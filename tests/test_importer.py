@@ -7,7 +7,7 @@ import pytest
 from stream_tracker.cli import main
 from stream_tracker.db import Database
 from stream_tracker.importer import ImportClient
-from stream_tracker.tracker import FrameTime, Tracker
+from stream_tracker.tracker import FrameTime, MatchState, Tracker
 
 from test_tracker import T0, feed
 
@@ -69,25 +69,49 @@ def test_post_needs_env(monkeypatch, tmp_path):
         main(["replay", str(tmp_path / "123456789.mp4"), "--post", "--db", str(tmp_path / "x.sqlite")])
 
 
+def test_phase_is_optional(tmp_path):
+    tracker = Tracker(Database(tmp_path / "t.sqlite"), channel="test", run_id="42")
+    assert "phase" not in tracker.export(MatchState(id=1, team_crops=None, last_hud=None))
+    with pytest.raises(SystemExit):
+        main(["replay", "x.mp4", "--phase", "Groups"])
+
+
+MATCH_SEQ = ([(590 + i, 590) for i in range(25)]
+             + [(628, 628), (629, 628), (655, 655), (662, 662), (663, 662)]
+             + [(1000, 1000), (1001, 1000), (1260, 1260), (1261, 1260)]
+             + [(1262 + i, 1260) for i in range(10)])
+
+
+def record_match(frame, db, **kw):
+    """Run one full recorded match through a new tracker; returns what it sent."""
+    sent = []
+    tracker = Tracker(db, channel="test", source="runs/42", run_id="42", on_match_end=sent.append, **kw)
+    feed(tracker, [(t, frame(src)) for t, src in MATCH_SEQ])
+    tracker.close(FrameTime(T0, 1300))
+    return sent
+
+
+def test_matches_numbered_within_their_phase(frame, tmp_path):
+    db = Database(tmp_path / "t.sqlite")
+    assert record_match(frame, db, phase="Qualifiers", first_match=35)[0]["match_id"] == 35
+    assert record_match(frame, db, phase="Main Event")[0]["match_id"] == 1
+    assert record_match(frame, db, phase="Qualifiers")[0]["match_id"] == 36  # continues, not restarts
+    assert [tuple(r) for r in db.conn.execute("SELECT phase, match_no FROM matches ORDER BY id")] == [
+        ("Qualifiers", 35), ("Main Event", 1), ("Qualifiers", 36)]
+
+
 def test_finished_match_is_exported_from_memory(frame, tmp_path):
     """A recorded match is handed on as one import object, and the DB is still written."""
-    sent = []
     db = Database(tmp_path / "t.sqlite")
-    tracker = Tracker(db, channel="test", source="runs/42", run_id="42", on_match_end=sent.append)
-    seq = [(590 + i, 590) for i in range(25)]
-    seq += [(628, 628), (629, 628), (655, 655), (662, 662), (663, 662)]
-    seq += [(1000, 1000), (1001, 1000), (1260, 1260), (1261, 1260)]
-    seq += [(1262 + i, 1260) for i in range(10)]
-    feed(tracker, [(t, frame(src)) for t, src in seq])
-    tracker.close(FrameTime(T0, 1300))
+    sent = record_match(frame, db, phase="Finals")
 
     assert len(sent) == 1
     m = sent[0]
-    assert m["run_id"] == "42" and m["match_id"] == 1
+    assert m["run_id"] == "42" and m["match_id"] == 1 and m["phase"] == "Finals" and "match_no" not in m
     assert m["red_team"] and m["blue_team"] and m["status"] == "complete"
     row = dict(db.conn.execute("SELECT * FROM matches WHERE id = 1").fetchone())
     for k in ("created_utc", "live_start_utc", "ended_utc", "end_reason", "red_team", "blue_team",
-              "red_score", "blue_score", "joined_late", "status"):
+              "red_score", "blue_score", "joined_late", "status", "phase"):
         assert m[k] == row[k], k
     ships = {(s["side"], s["slot"]): s for s in m["ships"]}
     for r in db.conn.execute("SELECT * FROM ships WHERE match_id = 1"):

@@ -158,6 +158,21 @@ def match_file(day_n, match_n):
     return f"day-{day_n}-match-{match_n:02d}.html"
 
 
+def number_matches(days):
+    """Give each match its tournament number in m["no"]: the tracker's match_no when it
+    has one, else counted on from the previous match, across days. Matches that never
+    went live (abandoned) get no number."""
+    last = 0
+    for d in days:
+        for m in d["matches"]:
+            m["no"] = m.get("match_no") or (last + 1 if m["live_start_utc"] else None)
+            last = m["no"] or last
+
+
+def match_label(m):
+    return f'Match {m["no"]}' if m["no"] else "Not played"
+
+
 def render_index(days):
     rows = []
     flown, banned = Counter(), Counter()
@@ -196,7 +211,7 @@ def render_day(n, d, n_days):
     for i, m in enumerate(d["matches"], 1):
         live = ts(m["live_start_utc"])
         rows.append(
-            f'<tr class="click"><td><a href="{match_file(n, i)}">Match {i}</a></td>'
+            f'<tr class="click"><td><a href="{match_file(n, i)}">{match_label(m)}</a></td>'
             f'<td>{live.strftime("%H:%M") if live else "—"}</td>'
             f'<td>{team_chip(m, "red")}</td>'
             f'<td class="num score"><span class="red-t">{m["red_score"] if m["red_score"] is not None else "—"}</span>'
@@ -287,12 +302,12 @@ def render_match(day_n, d, i, m):
     n_matches = len(d["matches"])
     nav = ['<a href="index.html">Index</a>', f'<a href="day-{day_n}.html">← Day {day_n}</a>']
     if i > 1:
-        nav.append(f'<a href="{match_file(day_n, i - 1)}">‹ Match {i - 1}</a>')
+        nav.append(f'<a href="{match_file(day_n, i - 1)}">‹ {match_label(d["matches"][i - 2])}</a>')
     if i < n_matches:
-        nav.append(f'<a href="{match_file(day_n, i + 1)}">Match {i + 1} ›</a>')
+        nav.append(f'<a href="{match_file(day_n, i + 1)}">{match_label(d["matches"][i])} ›</a>')
 
     body = f"""<div class="nav">{''.join(nav)}</div>
-<h1>Day {day_n}, Match {i}</h1>
+<h1>Day {day_n}, {match_label(m)}</h1>
 <div class="meta">{team_chip(m, "red")} <span>vs</span> {team_chip(m, "blue")} {end_badge(m)}
 <span>Live <b>{live.strftime("%Y-%m-%d %H:%M:%S") if live else "—"}</b> UTC</span>
 <span>Length <b>{mmss(length)}</b></span>
@@ -306,7 +321,7 @@ def render_match(day_n, d, i, m):
 <th class="num">Pts</th><th>Team</th><th></th></tr>
 {''.join(kill_rows) or '<tr><td colspan="8" class="dim">No kills recorded.</td></tr>'}
 </table></div></div>"""
-    return page(f"Day {day_n} Match {i} · {m['red_team']} vs {m['blue_team']}", body)
+    return page(f"Day {day_n} {match_label(m)} · {m['red_team']} vs {m['blue_team']}", body)
 
 
 def main():
@@ -318,6 +333,7 @@ def main():
     days = [load_day(p) for p in args.dbs]
     days = [d for d in days if d["matches"]]
     days.sort(key=lambda d: d["matches"][0]["live_start_utc"] or "")
+    number_matches(days)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 

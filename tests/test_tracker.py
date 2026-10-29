@@ -238,7 +238,7 @@ def test_abandoned_match_keeps_team_colours(tmp_path):
     later = tracker.grace_s + 1
     tracker._on_no_hud(FrameTime(T0 + timedelta(seconds=later), later))
     (row,) = rows(db_path, "SELECT * FROM matches")
-    assert row["status"] == "abandoned"
+    assert row["status"] == "abandoned" and row["match_no"] is None  # never went live: no number
     assert (row["red_team"], row["blue_team"]) == ("SEDITION.", "NEON NIGHTMARES")
 
 
