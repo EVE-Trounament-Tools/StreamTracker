@@ -38,6 +38,25 @@ env/bin/stream-tracker update-ships
 
 `--debug-dir DIR` saves a frame at every match event (open, live, death, end) for auditing.
 
+### Sending matches to the observed-import endpoint
+
+`--post` (on `live` and `replay`) also sends each match, as soon as it ends, to the observed-import endpoint: one match object per POST, built from what the tracker just recorded. The local database is still written as usual.
+
+The endpoint URL and import token are read from the environment and must never be committed. Put them in `.env` (gitignored):
+
+```bash
+OBSERVED_IMPORT_URL=...
+OBSERVED_IMPORT_TOKEN=...
+```
+
+```bash
+set -a; . ./.env; set +a
+env/bin/stream-tracker live eveonline --db at.sqlite --post --run-id at22-day1
+env/bin/stream-tracker replay runs/2873111426 --start 8:13:00 --db test.sqlite --post
+```
+
+`--run-id` and the local match id make the import key (`run_id:match_id`); posting the same match again replaces it. It defaults to the VOD id in a replay input, or `<channel>-<UTC date>` when live. Posts run in the background and retry server and network errors; a failure is logged and never stops tracking. `--start` and `--duration` also work on a `--save-hud` directory.
+
 ## How it works
 
 | What | How |

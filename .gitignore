@@ -10,3 +10,4 @@ runs/
 videos/
 *.part
 *.ytdl
+.env

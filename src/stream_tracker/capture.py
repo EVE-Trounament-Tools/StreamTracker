@@ -212,13 +212,19 @@ class StripCache:
     """Replays a HudRecorder directory. Frames without a saved strip come back
     black, which reads as no HUD."""
 
-    def __init__(self, directory: str | Path):
+    def __init__(self, directory: str | Path, start: float = 0.0, duration: float | None = None):
         self.dir = Path(directory)
+        self.start = start
+        self.end = start + duration if duration is not None else None
 
     def __iter__(self) -> Iterator[tuple[np.ndarray, FrameTime]]:
         blank = np.zeros((FRAME_H, FRAME_W, 3), np.uint8)
         with open(self.dir / "index.csv", newline="") as f:
             for offset, utc, _score, saved in csv.reader(f):
+                if float(offset) < self.start:
+                    continue
+                if self.end is not None and float(offset) >= self.end:
+                    break
                 t = FrameTime(datetime.fromisoformat(utc), float(offset))
                 if saved == "1":
                     strip = cv2.imread(str(self.dir / f"{int(t.offset):06d}.png"))

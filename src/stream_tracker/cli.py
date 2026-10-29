@@ -2,8 +2,9 @@
 
 import argparse
 import logging
+import re
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 import cv2
 import numpy as np
@@ -13,6 +14,7 @@ from pathlib import Path
 
 from .capture import FileSource, HudRecorder, LiveSource, StripCache, resolve_vod
 from .db import Database
+from .importer import ImportClient
 from .tracker import Tracker
 from .vocab import update_ship_csv
 
@@ -27,7 +29,34 @@ def parse_time(text: str) -> float:
     return total
 
 
-def run(source, tracker: Tracker, report_every: int = 600, recorder: HudRecorder | None = None) -> None:
+def run_id_for(args) -> str | None:
+    """--run-id, else the VOD id in a replay input, else <channel>-<UTC date> when live."""
+    if args.run_id:
+        return args.run_id
+    if args.cmd == "live":
+        return f"{args.channel.rstrip('/').split('/')[-1]}-{datetime.now(timezone.utc):%Y%m%d}"
+    m = re.search(r"(\d{6,})", Path(args.input.rstrip("/")).name) or re.search(r"videos/(\d+)", args.input)
+    return m.group(1) if m else None
+
+
+def make_tracker(args, source: str | None) -> tuple[Tracker, ImportClient | None]:
+    """The tracker, plus an observed-import client when --post is given.
+    Posting is in addition to the local database, never instead of it."""
+    client = run_id = None
+    if args.post:
+        run_id = run_id_for(args)
+        if not run_id:
+            raise SystemExit("--post needs a run id; pass --run-id")
+        client = ImportClient.from_env()
+        log.info("posting finished matches to observed import as run %s", run_id)
+    tracker = Tracker(Database(args.db), channel=args.channel, source=source, grace_s=args.grace,
+                      debug_dir=args.debug_dir, run_id=run_id,
+                      on_match_end=client.submit if client else None)
+    return tracker, client
+
+
+def run(source, tracker: Tracker, report_every: int = 600, recorder: HudRecorder | None = None,
+        client: ImportClient | None = None) -> None:
     times = []
     t = None
     try:
@@ -45,6 +74,8 @@ def run(source, tracker: Tracker, report_every: int = 600, recorder: HudRecorder
         log.info("interrupted")
     finally:
         tracker.close(t)
+        if client is not None:
+            client.close()  # wait for pending posts
         if recorder is not None:
             recorder.close()
         if times:
@@ -54,15 +85,14 @@ def run(source, tracker: Tracker, report_every: int = 600, recorder: HudRecorder
 
 
 def cmd_live(args) -> None:
-    db = Database(args.db)
-    tracker = Tracker(db, channel=args.channel, source="live", grace_s=args.grace,
-                      debug_dir=args.debug_dir)
-    run(LiveSource(args.channel, quality=args.quality), tracker)
+    tracker, client = make_tracker(args, "live")
+    run(LiveSource(args.channel, quality=args.quality), tracker, client=client)
 
 
 def cmd_replay(args) -> None:
     if (Path(args.input) / "index.csv").exists():
-        source = StripCache(args.input)
+        source = StripCache(args.input, start=parse_time(args.start) if args.start else 0.0,
+                            duration=parse_time(args.duration) if args.duration else None)
     else:
         path = args.input
         if "://" in path and ".m3u8" not in path:
@@ -75,11 +105,9 @@ def cmd_replay(args) -> None:
             realtime=args.realtime,
             start_utc=start_utc,
         )
-    db = Database(args.db)
-    tracker = Tracker(db, channel=args.channel, source=args.input, grace_s=args.grace,
-                      debug_dir=args.debug_dir)
+    tracker, client = make_tracker(args, args.input)
     recorder = HudRecorder(args.save_hud) if args.save_hud else None
-    run(source, tracker, recorder=recorder)
+    run(source, tracker, recorder=recorder, client=client)
 
 
 def cmd_calibrate(args) -> None:
@@ -137,6 +165,10 @@ def main(argv=None) -> None:
         p.add_argument("--grace", type=float, default=90.0,
                        help="seconds the HUD may be off screen before a live match is ended")
         p.add_argument("--debug-dir", help="save a frame at every match event")
+        p.add_argument("--post", action="store_true",
+                       help="also send each finished match to the observed-import endpoint"
+                            " (OBSERVED_IMPORT_URL and OBSERVED_IMPORT_TOKEN from the environment)")
+        p.add_argument("--run-id", help="run id for --post (default: the VOD id, or channel-date when live)")
 
     p = sub.add_parser("live", help="track a live Twitch channel")
     p.add_argument("channel", help="channel name or stream URL")
