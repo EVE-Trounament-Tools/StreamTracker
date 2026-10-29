@@ -13,12 +13,14 @@ so when it reaches 0:00 the HUD switches to a red clock with the game time
 still remaining, and play continues.
 """
 
+import json
 import logging
 from collections import Counter
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Callable
 
 import cv2
 import numpy as np
@@ -115,6 +117,12 @@ class MatchState:
     end_reason: str | None = None
     series_id: int | None = None
     written_teams: dict[str, str | None] = field(default_factory=dict)  # provisional names in the DB
+    # What has been written for this match, kept in memory so the finished
+    # match can be sent on (observed import) without reading the DB back.
+    row: dict = field(default_factory=dict)
+    bans: dict[str, list[tuple[str, str | None]]] = field(default_factory=dict)
+    ships: dict[tuple[str, int], dict] = field(default_factory=dict)
+    events: list[dict] = field(default_factory=list)
 
 
 def team_strip(frame: np.ndarray) -> np.ndarray:
@@ -136,10 +144,14 @@ class Tracker:
         vocab: ShipVocab | None = None,
         grace_s: float = 90.0,
         debug_dir: str | Path | None = None,
+        run_id: str | None = None,
+        on_match_end: Callable[[dict], None] | None = None,
     ):
         self.db = db
         self.channel = channel
         self.source = source
+        self.run_id = run_id
+        self.on_match_end = on_match_end  # called with each finished match's import object
         self.vocab = vocab or default_vocab()
         self.teams = TeamNames.from_file()
         for row in db.conn.execute("SELECT red_team, blue_team FROM matches"):
@@ -291,7 +303,7 @@ class Tracker:
                 self._end(m.last_hud, "hud_lost")
             elif not self._discard_if_brief(m):
                 self._finish_identity(m)  # record the teams (and their colours) anyway
-                self.db.update_match(m.id, status="abandoned")
+                self._update(m, status="abandoned")
                 if m.series_id is not None:
                     self.db.refresh_series(m.series_id)
                 self._event(t, "abandoned")
@@ -302,6 +314,8 @@ class Tracker:
     def _open(self, frame: np.ndarray, t: FrameTime) -> MatchState:
         mid = self.db.create_match(self.channel, self.source, iso(t.utc))
         self.match = MatchState(id=mid, team_crops=team_strip(frame), last_hud=t)
+        self.match.row = dict(channel=self.channel, source=self.source, created_utc=iso(t.utc),
+                              joined_late=0, status="pending")
         self._event(t, "match_opened")
         log.info("match %d opened at %.0fs", mid, t.offset)
         return self.match
@@ -327,7 +341,7 @@ class Tracker:
         m.zero_frames = 0
         if m.identity_reads < IDENTITY_MAX_READS:
             m.identity_settled = False  # keep voting; names settled early on few reads
-        self.db.update_match(m.id, status="live", ended_utc=None, end_reason=None)
+        self._update(m, status="live", ended_utc=None, end_reason=None)
         if m.series_id is not None:
             self.db.refresh_series(m.series_id)  # its result no longer counts
         self._event(t, "match_reopened")
@@ -354,8 +368,8 @@ class Tracker:
         overtime = None
         if m.tidi_start is not None:
             overtime = round(t.offset - m.tidi_start.offset)
-        self.db.update_match(
-            m.id,
+        self._update(
+            m,
             tidi_overtime_s=overtime,
             ended_utc=iso(t.utc),
             end_reason=reason,
@@ -369,9 +383,16 @@ class Tracker:
             self.db.refresh_series(m.series_id)
             series = self.db.series_summary(m.id)
             if series:
+                # Only the game number: local series ids are per database, not global.
+                m.row["series_game"] = series["game"]
                 self._event(t, "series_updated", series)
                 log.info("match %d: series %d game %d, %s", m.id, series["series_id"],
                          series["game"], series["wins"])
+        if self.on_match_end is not None:
+            try:
+                self.on_match_end(self.export(m))
+            except Exception:
+                log.exception("match %d: sending to observed import failed", m.id)
 
     # ------------------------------------------------------------------- phase
 
@@ -386,7 +407,7 @@ class Tracker:
             if not m.countdown_dated and r.clock is not None and 0 < r.clock <= 30:
                 m.countdown_dated = True
                 start = t.utc - timedelta(seconds=30 - r.clock)
-                self.db.update_match(m.id, countdown_start_utc=iso(start))
+                self._update(m, countdown_start_utc=iso(start))
                 self._event(t, "countdown", {"clock": r.clock})
         if r.tidi:
             self._update_tidi(r, t)
@@ -411,7 +432,7 @@ class Tracker:
                 m.live_start_offset = first_t.offset - (MATCH_LENGTH_S - first_clock)
                 start = first_t.utc - timedelta(seconds=MATCH_LENGTH_S - first_clock)
                 late = not m.saw_countdown
-                self.db.update_match(m.id, live_start_utc=iso(start), joined_late=int(late),
+                self._update(m, live_start_utc=iso(start), joined_late=int(late),
                                      status="live")
                 self._event(t, "live", {"clock": first_clock, "joined_late": late})
         if r.phase in (Phase.PRE, Phase.COUNTDOWN, Phase.LIVE):
@@ -456,12 +477,12 @@ class Tracker:
                 s = m.slots.get(key)
                 if s is None:
                     s = m.slots[key] = Slot(side, row.slot)
-                    self.db.upsert_ship(m.id, side, row.slot)
+                    self._ship(m, side, row.slot)
                 if row.pts is not None:
                     before = s.points
                     s.pts[row.pts] += 1
                     if s.points != before:
-                        self.db.upsert_ship(m.id, side, row.slot, points=s.points)
+                        self._ship(m, side, row.slot, points=s.points)
                 if s.dead:
                     continue
                 if row.status == "alive":
@@ -500,7 +521,7 @@ class Tracker:
                 death_confidence=s.death_confidence,
                 gap_before_s=s.first_dead_gap or None,
             )
-        self.db.upsert_ship(m.id, s.side, s.slot, **fields)
+        self._ship(m, s.side, s.slot, **fields)
         self._event(t, "death", {"side": s.side, "slot": s.slot, "points": s.points, **fields})
         log.info("match %d: %s slot %d died (%s)", m.id, s.side, s.slot, s.death_confidence)
 
@@ -527,7 +548,7 @@ class Tracker:
             if low and self._score_agrees(side, r):
                 for s in low:
                     s.death_confidence = "high"
-                    self.db.upsert_ship(m.id, side, s.slot, death_confidence="high")
+                    self._ship(m, side, s.slot, death_confidence="high")
 
     def _check_end(self, r: FrameReading, t: FrameTime) -> None:
         m = self.match
@@ -644,7 +665,7 @@ class Tracker:
             teams[side] = self.teams.snap(c.most_common(1)[0][0]) if c else None
         if teams != m.written_teams:
             m.written_teams = teams
-            self.db.update_match(m.id, red_team=teams["red"], blue_team=teams["blue"])
+            self._update(m, red_team=teams["red"], blue_team=teams["blue"])
 
     def _settle_identity(self, m: MatchState) -> None:
         m.identity_settled = True
@@ -656,7 +677,7 @@ class Tracker:
         teams = {side: self.teams.snap(best(("team", side))) for side in SIDES}
         for name in teams.values():
             self.teams.add(name)
-        self.db.update_match(m.id, red_team=teams["red"], blue_team=teams["blue"])
+        self._update(m, red_team=teams["red"], blue_team=teams["blue"])
         for side in SIDES:
             names = best(("bans", side))
             if names is not None:
@@ -665,12 +686,13 @@ class Tracker:
             else:
                 bans = [(raw, None) for raw in best(("bans_raw", side)) or ()]
             self.db.set_bans(m.id, side, bans)
+            m.bans[side] = bans
             slots = sorted({k[2] for k in m.votes if k[0] == "ship_raw" and k[1] == side})
             for i in slots:
                 name = best(("ship", side, i))
                 raw, score = m.raw[("ship", side, i, name)] if name else (best(("ship_raw", side, i)), None)
-                self.db.upsert_ship(
-                    m.id, side, i,
+                self._ship(
+                    m, side, i,
                     ship_raw=raw,
                     ship_type=name,
                     match_confidence=score,
@@ -679,25 +701,50 @@ class Tracker:
         log.info("match %d identity: %s vs %s", m.id, teams["red"], teams["blue"])
         t = self._t
         ts, offset = (iso(t.utc), t.offset) if t else (iso(datetime.now().astimezone()), None)
-        self.db.log_event(m.id, ts, offset, "identity_settled", {"reads": m.identity_reads})
+        self._log(m, ts, offset, "identity_settled", {"reads": m.identity_reads})
         # Repeat pairings are games of one series (Bo3/Bo5), even with other
         # matches played in between.
         m.series_id, mismatch = self.db.assign_series(m.id)
         if mismatch:
             log.warning("match %d: %s vs %s played recently with other pilots; not joined to that series",
                         m.id, teams["red"], teams["blue"])
-            self.db.log_event(m.id, ts, offset, "series_mismatch", None)
+            self._log(m, ts, offset, "series_mismatch", None)
         elif m.series_id is not None:
             series = self.db.series_summary(m.id)
             log.info("match %d: series %d game %d", m.id, m.series_id, series["game"])
-            self.db.log_event(m.id, ts, offset, "series", series)
+            self._log(m, ts, offset, "series", series)
 
     # ------------------------------------------------------------------- utils
+
+    def export(self, m: MatchState) -> dict:
+        """The match as one observed-import object (see README), from memory."""
+        bans = [dict(side=side, ordinal=i, ship_type=typ, ship_raw=raw)
+                for side in SIDES for i, (raw, typ) in enumerate(m.bans.get(side, []), 1)]
+        ship_keys = ("ship_type", "ship_raw", "pilot", "points", "died_match_s", "died_utc",
+                     "match_confidence", "death_confidence")
+        ships = [dict(side=side, slot=slot, **{k: fields.get(k) for k in ship_keys})
+                 for (side, slot), fields in sorted(m.ships.items(), key=lambda kv: (kv[0][0] != "red", kv[0][1]))]
+        return dict(run_id=self.run_id, match_id=m.id, **m.row, bans=bans, ships=ships, events=list(m.events))
+
+    def _update(self, m: MatchState, **fields) -> None:
+        self.db.update_match(m.id, **fields)
+        m.row.update(fields)
+
+    def _ship(self, m: MatchState, side: str, slot: int, **fields) -> None:
+        self.db.upsert_ship(m.id, side, slot, **fields)
+        m.ships.setdefault((side, slot), {}).update(fields)
+
+    def _log(self, m: MatchState | None, ts: str, offset: float | None, kind: str,
+             payload: dict | None = None) -> None:
+        self.db.log_event(m.id if m else None, ts, offset, kind, payload)
+        if m is not None:
+            m.events.append(dict(kind=kind, ts_utc=ts, stream_offset_s=offset,
+                                 payload_json=json.dumps(payload) if payload else None))
 
     def _event(self, t: FrameTime, kind: str, payload: dict | None = None) -> None:
         """Log an event; with debug_dir, also save the current frame for auditing."""
         mid = self.match.id if self.match else None
-        self.db.log_event(mid, iso(t.utc), t.offset, kind, payload)
+        self._log(self.match, iso(t.utc), t.offset, kind, payload)
         if self.debug_dir is not None and self._frame is not None:
             name = f"m{mid}_{int(self._t.offset):06d}_{kind}.jpg"
             cv2.imwrite(str(self.debug_dir / name), self._frame)
