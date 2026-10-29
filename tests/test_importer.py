@@ -94,8 +94,8 @@ def test_finished_match_is_exported_from_memory(frame, tmp_path):
         s = ships[(r["side"], r["slot"])]
         assert (s["pilot"], s["ship_type"], s["points"], s["died_utc"]) == (
             r["pilot"], r["ship_type"], r["points"], r["died_utc"])
-    bans = [(b["side"], b["ordinal"], b["ship_type"]) for b in m["bans"]]
-    assert bans == [(r["side"], r["ordinal"], r["ship_type"]) for r in db.conn.execute(
+    bans = [(b["side"], b["ordinal"], b["ship_type"], b["pick"]) for b in m["bans"]]
+    assert bans == [(r["side"], r["ordinal"], r["ship_type"], r["pick"]) for r in db.conn.execute(
         "SELECT * FROM bans WHERE match_id = 1 ORDER BY side DESC, ordinal")]
     assert [e["kind"] for e in m["events"]] == [r["kind"] for r in db.conn.execute(
         "SELECT kind FROM events WHERE match_id = 1 ORDER BY id")]
