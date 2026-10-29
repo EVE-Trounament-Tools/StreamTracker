@@ -37,6 +37,14 @@ BAN_TOP, BAN_PITCH = 785, 20
 RED_BAN_X: tuple[int, int] = (8, 300)
 BLUE_BAN_X: tuple[int, int] = (1620, 1912)
 
+# Pre-match draft panel: one card per ban, left to right in pick order, each
+# under a magenta (red) or cyan (blue) bar. Card count and width vary, and the
+# whole panel sits lower in some years, so positions are measured from the
+# bars rather than fixed.
+DRAFT_BAR_SEARCH: Box = (355, 760, 1880, 880)
+DRAFT_LABEL_X: tuple[int, int] = (155, 240)  # "RED TEAM" label, below the bars' top
+DRAFT_TEAM_X: tuple[int, int] = (155, 345)
+
 # Roster table.
 MAX_ROWS = 10
 ROW_TOP, ROW_PITCH = 862, 18

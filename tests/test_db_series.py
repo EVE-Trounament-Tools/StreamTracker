@@ -137,3 +137,16 @@ def test_series_ends_once_either_team_plays_someone_else(tmp_path):
     _, final, _ = add_match(db, "A", "B", 120, 113, 0)
     assert final not in (None, early)
     assert series(db, early)["games"] == 2 and series(db, final)["games"] == 1
+
+
+def test_old_database_gets_ban_picks(tmp_path):
+    path = tmp_path / "old.sqlite"
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE bans (id INTEGER PRIMARY KEY, match_id INTEGER NOT NULL, side TEXT NOT NULL,"
+                 " ordinal INTEGER NOT NULL, ship_raw TEXT, ship_type TEXT, UNIQUE (match_id, side, ordinal))")
+    conn.commit()
+    conn.close()
+    db = Database(path)
+    mid = db.create_match(None, None, T0.isoformat())
+    db.set_bans(mid, "red", [("Curse", "Curse"), ("Eos", "Eos")], picks=[2, 3])
+    assert [tuple(r) for r in db.conn.execute("SELECT ordinal, pick FROM bans ORDER BY ordinal")] == [(1, 2), (2, 3)]

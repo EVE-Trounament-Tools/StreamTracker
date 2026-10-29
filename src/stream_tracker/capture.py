@@ -20,7 +20,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from . import hud
+from . import draft, hud
 from .layout import FRAME_H, FRAME_W
 from .tracker import FrameTime
 
@@ -181,8 +181,8 @@ class LiveSource:
 # ------------------------------------------------------------------ HUD cache
 #
 # Streaming a 9-hour VOD takes a long time, so a replay can also save the HUD
-# strip of every frame that looks anything like the HUD, plus an index of all
-# frames. StripCache replays that offline in seconds.
+# strip of every frame that looks anything like the HUD or shows the draft
+# panel, plus an index of all frames. StripCache replays that offline in seconds.
 
 STRIP_TOP = 740  # every HUD region lies below this row
 CACHE_MIN_ANCHOR = 0.4  # looser than detection, so near-misses are kept too
@@ -197,7 +197,8 @@ class HudRecorder:
 
     def add(self, frame: np.ndarray, t: FrameTime) -> None:
         score = max(hud.anchor_scores(frame).values())
-        saved = score >= CACHE_MIN_ANCHOR
+        # The draft panel (bans in pick order) is in the strip too.
+        saved = score >= CACHE_MIN_ANCHOR or draft.find_panel(frame) is not None
         if saved:
             cv2.imwrite(str(self.dir / f"{int(t.offset):06d}.png"), frame[STRIP_TOP:],
                         [cv2.IMWRITE_PNG_COMPRESSION, 1])

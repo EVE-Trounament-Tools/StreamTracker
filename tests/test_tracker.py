@@ -254,3 +254,157 @@ def test_points_not_taken_from_ship_list(frame, tmp_path):
     read = reader.read_frame(frame(1000)).rows
     ships = rows(db_path, "SELECT * FROM ships")
     assert ships and all(s["points"] == read[s["side"]][s["slot"]].pts != 999 for s in ships)
+
+
+DRAFT_BANS = [("blue", "Crucifier"), ("red", "Curse"), ("red", "Zarmazd"), ("blue", "Armageddon"),
+              ("blue", "Sentinel"), ("red", "Ashimmu")]
+
+
+def _fake_draft(monkeypatch, red="Neon Nightmares", blue="Sedition.", bans=DRAFT_BANS):
+    """Any frame shows the draft panel; reading it gives these teams and bans."""
+    from stream_tracker import draft
+
+    panel = draft.Panel([(0, 1, side) for side, _ in bans], 0, 1, {})
+    monkeypatch.setattr(draft, "find_panel", lambda f: panel)
+    monkeypatch.setattr(draft, "read_panel", lambda f, p: draft.DraftRead({"red": red, "blue": blue}, list(bans)))
+
+
+def _see_draft(tracker, frames=5, start=0):
+    blank = np.zeros((1, 1, 3), np.uint8)
+    for i in range(frames):
+        tracker._check_draft(blank, FrameTime(T0 + timedelta(seconds=start + i), start + i))
+        if tracker._draft_job is not None:
+            tracker._draft_job.result()
+            tracker._collect_draft()
+
+
+def test_bans_follow_the_draft_panel(monkeypatch, frame, tmp_path):
+    """The HUD lists bans out of order; the draft panel shown before the
+    match has them in pick order."""
+    db_path = tmp_path / "t.sqlite"
+    tracker = Tracker(Database(db_path), channel="test")
+    _fake_draft(monkeypatch)
+    _see_draft(tracker, start=500)
+    assert tracker.draft is not None
+    seq = [(590 + i, 590) for i in range(25)] + [(628, 628), (629, 628)]
+    feed(tracker, [(t, frame(src)) for t, src in seq])
+    tracker.close()
+    bans = rows(db_path, "SELECT side, ordinal, ship_type, pick FROM bans ORDER BY pick")
+    assert [(b["side"], b["ship_type"]) for b in bans] == DRAFT_BANS
+    assert [b["pick"] for b in bans] == [1, 2, 3, 4, 5, 6]
+    red = [b["ship_type"] for b in sorted(bans, key=lambda b: b["ordinal"]) if b["side"] == "red"]
+    assert red == ["Curse", "Zarmazd", "Ashimmu"]
+    kinds = [e["kind"] for e in rows(db_path, "SELECT kind FROM events")]
+    assert "bans_from_draft" in kinds and "draft_ban_mismatch" not in kinds
+    assert tracker.draft is None  # used up
+
+
+def test_draft_sides_matched_by_team_name(monkeypatch, tmp_path):
+    db_path, tracker, m = _hand_match(tmp_path)
+    _fake_draft(monkeypatch, red="Sedition.", blue="Neon Nightmares",
+                bans=[("red", "Crucifier"), ("blue", "Curse")])
+    _see_draft(tracker)
+    for _ in range(3):
+        tracker._vote(m, _identity(red="NEON NIGHTMARES", blue="SEDITION.", red_bans=("Curse",),
+                                   blue_bans=("Crucifier",)))
+    bans = rows(db_path, "SELECT side, ship_type, pick FROM bans ORDER BY pick")
+    assert [(b["side"], b["ship_type"], b["pick"]) for b in bans] == [("blue", "Crucifier", 1), ("red", "Curse", 2)]
+
+
+def test_other_teams_draft_falls_back_to_hud(monkeypatch, tmp_path):
+    db_path, tracker, m = _hand_match(tmp_path)
+    _fake_draft(monkeypatch, red="Odin's Call", blue="The Skeleton Crew")
+    _see_draft(tracker)
+    for _ in range(3):
+        tracker._vote(m, _identity())
+    bans = rows(db_path, "SELECT ship_type, pick FROM bans WHERE side='red' ORDER BY ordinal")
+    assert [(b["ship_type"], b["pick"]) for b in bans] == [("Zarmazd", None), ("Eos", None)]
+    assert tracker.draft is not None
+
+
+def test_stale_draft_falls_back_to_hud(monkeypatch, tmp_path):
+    from stream_tracker.tracker import DRAFT_MAX_AGE_S
+
+    db_path, tracker, m = _hand_match(tmp_path)
+    _fake_draft(monkeypatch, red="THE TUSKERS CO.", blue="META RELOADED")
+    _see_draft(tracker)
+    tracker._t = FrameTime(T0, DRAFT_MAX_AGE_S + 10)
+    for _ in range(3):
+        tracker._vote(m, _identity())
+    assert rows(db_path, "SELECT pick FROM bans WHERE pick IS NOT NULL") == []
+
+
+def test_draft_still_filling_in_restarts_votes(monkeypatch, tmp_path):
+    from stream_tracker import draft
+
+    _, tracker, _ = _hand_match(tmp_path)
+    _fake_draft(monkeypatch, bans=DRAFT_BANS[:4])
+    _see_draft(tracker, frames=2)
+    _fake_draft(monkeypatch)
+    _see_draft(tracker, frames=2, start=2)
+    assert tracker.draft is None  # only 2 reads of the full panel so far
+    _see_draft(tracker, frames=1, start=4)
+    assert len(tracker.draft.bans) == 6
+
+
+def test_reopened_match_keeps_draft_order(monkeypatch, tmp_path):
+    db_path, tracker, m = _hand_match(tmp_path)
+    tracker.match = m
+    _fake_draft(monkeypatch, red="THE TUSKERS CO.", blue="META RELOADED",
+                bans=[("red", "Eos"), ("red", "Zarmazd")])
+    _see_draft(tracker)
+    for _ in range(3):
+        tracker._vote(m, _identity())
+    tracker._reopen(FrameTime(T0, 10))
+    for _ in range(3):
+        tracker._vote(m, _identity())
+    bans = rows(db_path, "SELECT ship_type, pick FROM bans WHERE side='red' ORDER BY ordinal")
+    assert [(b["ship_type"], b["pick"]) for b in bans] == [("Eos", 1), ("Zarmazd", 2)]
+
+
+def test_draft_taken_despite_a_misread_hud_name(monkeypatch, tmp_path):
+    """One name matches and the banned ships agree (2873111426: the HUD read
+    Rote Kapelle as "UNC KAPELLE")."""
+    db_path, tracker, m = _hand_match(tmp_path)
+    _fake_draft(monkeypatch, red="Neon Nightmares", blue="Rote Kapelle",
+                bans=[("red", "Zarmazd"), ("blue", "Maulus"), ("blue", "Vigil"), ("red", "Eos")])
+    _see_draft(tracker)
+    for _ in range(3):
+        tracker._vote(m, _identity(red="NEON NIGHTMARES", blue="UNC KAPELLE", red_bans=("Eos", "Zarmazd"),
+                                   blue_bans=("Vigil", "Maulus")))
+    bans = rows(db_path, "SELECT side, ship_type, pick FROM bans ORDER BY pick")
+    assert [b["ship_type"] for b in bans] == ["Zarmazd", "Maulus", "Vigil", "Eos"]
+
+
+def test_draft_taken_when_hud_names_are_stale(monkeypatch, tmp_path):
+    """The HUD kept the previous match's team names; the bans still identify it."""
+    db_path, tracker, m = _hand_match(tmp_path)
+    _fake_draft(monkeypatch, red="Dracarys.", blue="Psychokids.",
+                bans=[("red", "Zarmazd"), ("blue", "Maulus"), ("blue", "Vigil"), ("red", "Eos")])
+    _see_draft(tracker)
+    for _ in range(3):
+        tracker._vote(m, _identity(red="CRITICAL. MASS.", blue="THE SKELETON CREW", red_bans=("Eos", "Zarmazd"),
+                                   blue_bans=("Vigil", "Maulus")))
+    assert rows(db_path, "SELECT count(*) n FROM bans WHERE pick IS NOT NULL") == [{"n": 4}]
+
+
+def test_draft_not_taken_on_one_name_alone(monkeypatch, tmp_path):
+    db_path, tracker, m = _hand_match(tmp_path)
+    _fake_draft(monkeypatch, red="THE TUSKERS CO.", blue="Sedition.")
+    _see_draft(tracker)
+    for _ in range(3):
+        tracker._vote(m, _identity())
+    assert rows(db_path, "SELECT count(*) n FROM bans WHERE pick IS NOT NULL") == [{"n": 0}]
+
+
+def test_clearer_read_wins_a_one_ship_disagreement(monkeypatch, tmp_path):
+    """The panel read "Rapler" (-> Reaper) and the HUD "?agu": each side
+    keeps the read that matches the ship list best, in pick order."""
+    db_path, tracker, m = _hand_match(tmp_path)
+    _fake_draft(monkeypatch, red="THE TUSKERS CO.", blue="META RELOADED",
+                bans=[("red", "Rapler"), ("blue", "Magus"), ("red", "Huginn"), ("blue", "Eos")])
+    _see_draft(tracker)
+    for _ in range(3):
+        tracker._vote(m, _identity(red_bans=("Huginn", "Rapier"), blue_bans=("?agu", "Eos")))
+    bans = rows(db_path, "SELECT ship_type, pick FROM bans ORDER BY pick")
+    assert [(b["ship_type"], b["pick"]) for b in bans] == [("Rapier", 1), ("Magus", 2), ("Huginn", 3), ("Eos", 4)]

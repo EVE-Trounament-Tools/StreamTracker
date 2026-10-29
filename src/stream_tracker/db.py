@@ -51,9 +51,10 @@ CREATE TABLE IF NOT EXISTS bans (
     id INTEGER PRIMARY KEY,
     match_id INTEGER NOT NULL REFERENCES matches(id),
     side TEXT NOT NULL CHECK (side IN ('red', 'blue')),
-    ordinal INTEGER NOT NULL,   -- 1..10, top to bottom
+    ordinal INTEGER NOT NULL,   -- 1..10 per side, in pick order (else top to bottom on the HUD)
     ship_raw TEXT,
     ship_type TEXT,             -- NULL when OCR didn't match the ship list
+    pick INTEGER,               -- overall pick order across both sides; NULL when not seen
     UNIQUE (match_id, side, ordinal)
 );
 
@@ -89,7 +90,10 @@ CREATE TABLE IF NOT EXISTS events (
 
 # Columns added after the first release; ALTERed into older databases.
 MIGRATIONS = {
-    "matches": [("series_id", "INTEGER REFERENCES series(id)"), ("series_game", "INTEGER")],
+    "matches": [("series_id", "INTEGER REFERENCES series(id)"), ("series_game", "INTEGER"),
+                ("tidi_overtime_s", "INTEGER")],
+    "ships": [("died_clock_s", "INTEGER"), ("died_in_tidi", "INTEGER")],
+    "bans": [("pick", "INTEGER")],
 }
 
 
@@ -169,11 +173,13 @@ class Database:
         cols = ", ".join(f"{k} = ?" for k in fields)
         self._commit(f"UPDATE matches SET {cols} WHERE id = ?", (*fields.values(), match_id))
 
-    def set_bans(self, match_id: int, side: str, bans: list[tuple[str, str | None]]) -> None:
+    def set_bans(self, match_id: int, side: str, bans: list[tuple[str, str | None]],
+                 picks: list[int] | None = None) -> None:
+        picks = picks or [None] * len(bans)
         self.conn.execute("DELETE FROM bans WHERE match_id = ? AND side = ?", (match_id, side))
         self.conn.executemany(
-            "INSERT INTO bans (match_id, side, ordinal, ship_raw, ship_type) VALUES (?, ?, ?, ?, ?)",
-            [(match_id, side, i + 1, raw, typ) for i, (raw, typ) in enumerate(bans)],
+            "INSERT INTO bans (match_id, side, ordinal, ship_raw, ship_type, pick) VALUES (?, ?, ?, ?, ?, ?)",
+            [(match_id, side, i + 1, raw, typ, pick) for i, ((raw, typ), pick) in enumerate(zip(bans, picks))],
         )
         self.conn.commit()
 

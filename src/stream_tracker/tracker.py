@@ -24,12 +24,13 @@ from typing import Callable
 
 import cv2
 import numpy as np
+from rapidfuzz import fuzz
 
-from . import layout as L, reader
+from . import draft, layout as L, reader
 from .db import Database
 from .hud import Phase
 from .reader import SIDES, FrameReading, Identity
-from .vocab import ShipVocab, TeamNames, default_vocab
+from .vocab import TEAM_SNAP_SCORE, ShipVocab, TeamNames, default_vocab
 
 log = logging.getLogger(__name__)
 
@@ -56,12 +57,38 @@ SAME_TEAMS_MIN_CORR = 0.9
 FOREIGN_MAX_FRAMES = 25
 MIN_MATCH_HUD_FRAMES = 25
 CLOCK_TOLERANCE_S = 3
+# The pre-match draft panel gives the bans in pick order. It is used for the
+# next match between its teams if that starts within this long of the panel
+# last being on screen; a panel gone this long is a new one when it returns.
+DRAFT_MAX_AGE_S = 1800
+DRAFT_GAP_S = 60
+DRAFT_MIN_BANS_TO_AGREE = 3  # fewer bans than this say too little to recognise a match by
+OTHER = {"red": "blue", "blue": "red"}
 
 
 @dataclass
 class FrameTime:
     utc: datetime
     offset: float  # seconds since the source started
+
+
+@dataclass
+class Draft:
+    """A settled read of the draft panel."""
+    teams: dict[str, str]
+    bans: list[tuple[str, str, str | None]]  # (side, raw, ship_type) in pick order
+    last_seen: FrameTime
+
+
+def same_team(a: str | None, b: str | None) -> bool:
+    """Team names from the draft panel and the HUD: the same, allowing OCR
+    slips and a name cut short on either."""
+    if not (a and b):
+        return False
+    a, b = a.upper().rstrip(". "), b.upper().rstrip(". ")
+    if fuzz.ratio(a, b) >= TEAM_SNAP_SCORE:
+        return True
+    return min(len(a), len(b)) >= 4 and fuzz.partial_ratio(a, b) >= 95
 
 
 def iso(t: datetime) -> str:
@@ -120,7 +147,9 @@ class MatchState:
     # What has been written for this match, kept in memory so the finished
     # match can be sent on (observed import) without reading the DB back.
     row: dict = field(default_factory=dict)
-    bans: dict[str, list[tuple[str, str | None]]] = field(default_factory=dict)
+    bans: dict[str, list[tuple[str, str | None, int | None]]] = field(default_factory=dict)  # (raw, type, pick)
+    # Bans from the draft panel as (side, raw, type, pick), once taken for this match.
+    draft_bans: list[tuple[str, str, str | None, int]] | None = None
     ships: dict[tuple[str, int], dict] = field(default_factory=dict)
     events: list[dict] = field(default_factory=list)
 
@@ -173,6 +202,13 @@ class Tracker:
         # Team strip of the last match that finished, so a post-match replay
         # of the HUD isn't mistaken for a new match.
         self._finished_teams: np.ndarray | None = None
+        self.draft: Draft | None = None
+        self._draft_job: Future | None = None
+        self._draft_lag = 0
+        self._draft_votes: Counter = Counter()
+        self._draft_bars = 0
+        self._draft_settled = False
+        self._draft_seen: FrameTime | None = None
 
     # ------------------------------------------------------------------ frames
 
@@ -184,6 +220,11 @@ class Tracker:
             if self._identity_lag >= IDENTITY_MAX_LAG_FRAMES:
                 wait([self._identity_job])
         self._collect_identity()
+        if self._draft_job is not None:
+            self._draft_lag += 1
+            if self._draft_lag >= IDENTITY_MAX_LAG_FRAMES:
+                wait([self._draft_job])
+        self._collect_draft()
         if r.hud:
             self.hud_streak += 1
             self.no_hud_streak = 0
@@ -191,6 +232,7 @@ class Tracker:
         else:
             self.hud_streak = 0
             self.no_hud_streak += 1
+            self._check_draft(frame, t)
             self._on_no_hud(t)
         return r
 
@@ -678,15 +720,28 @@ class Tracker:
         for name in teams.values():
             self.teams.add(name)
         self._update(m, red_team=teams["red"], blue_team=teams["blue"])
+        hud = {}
         for side in SIDES:
             names = best(("bans", side))
             if names is not None:
-                bans = [(raw, None if name.startswith(UNMATCHED) else name)
-                        for raw, name in zip(m.raw[("bans", side, names)], names)]
+                hud[side] = [(raw, None if name.startswith(UNMATCHED) else name)
+                             for raw, name in zip(m.raw[("bans", side, names)], names)]
             else:
-                bans = [(raw, None) for raw in best(("bans_raw", side)) or ()]
-            self.db.set_bans(m.id, side, bans)
-            m.bans[side] = bans
+                hud[side] = [(raw, None) for raw in best(("bans_raw", side)) or ()]
+        drafted = m.draft_bans or self._take_draft(m, teams, hud)
+        for side in SIDES:
+            bans = hud[side]
+            picks = None
+            if drafted is not None:
+                hud_bans = bans
+                bans = self._reconcile_bans([(raw, typ) for s, raw, typ, _ in drafted if s == side], hud_bans)
+                picks = [pick for s, _, _, pick in drafted if s == side]
+                if sorted(typ or raw for raw, typ in bans) != sorted(typ or raw for raw, typ in hud_bans):
+                    self._log(m, *self._now(), "draft_ban_mismatch",
+                              {"side": side, "draft": [list(b) for b in bans],
+                               "hud": [list(b) for b in hud_bans]})
+            self.db.set_bans(m.id, side, bans, picks)
+            m.bans[side] = [(raw, typ, pick) for (raw, typ), pick in zip(bans, picks or [None] * len(bans))]
             slots = sorted({k[2] for k in m.votes if k[0] == "ship_raw" and k[1] == side})
             for i in slots:
                 name = best(("ship", side, i))
@@ -699,8 +754,7 @@ class Tracker:
                     pilot=best(("pilot", side, i)),
                 )
         log.info("match %d identity: %s vs %s", m.id, teams["red"], teams["blue"])
-        t = self._t
-        ts, offset = (iso(t.utc), t.offset) if t else (iso(datetime.now().astimezone()), None)
+        ts, offset = self._now()
         self._log(m, ts, offset, "identity_settled", {"reads": m.identity_reads})
         # Repeat pairings are games of one series (Bo3/Bo5), even with other
         # matches played in between.
@@ -714,12 +768,146 @@ class Tracker:
             log.info("match %d: series %d game %d", m.id, m.series_id, series["game"])
             self._log(m, ts, offset, "series", series)
 
+    # ------------------------------------------------------------------- draft
+
+    def _check_draft(self, frame: np.ndarray, t: FrameTime) -> None:
+        """Read the draft panel while it is on screen, until 3 reads agree."""
+        panel = draft.find_panel(frame)
+        if panel is None:
+            return
+        if self._draft_seen is not None and t.offset - self._draft_seen.offset > DRAFT_GAP_S:
+            self._draft_settled = False  # a new panel
+            self._draft_votes.clear()
+        self._draft_seen = t
+        if len(panel.bars) != self._draft_bars:
+            # Still being filled in, pick by pick: earlier reads are stale.
+            self._draft_bars = len(panel.bars)
+            self._draft_settled = False
+            self._draft_votes.clear()
+        if self._draft_settled:
+            if self.draft is not None:
+                self.draft.last_seen = t
+            return
+        if self._draft_job is None:
+            self._draft_job = self._pool.submit(draft.read_panel, frame.copy(), panel)
+            self._draft_lag = 0
+
+    def _collect_draft(self) -> None:
+        job = self._draft_job
+        if job is None or not job.done():
+            return
+        self._draft_job = None
+        try:
+            read = job.result()
+        except Exception:
+            log.exception("draft read failed")
+            return
+        if len(read.bans) != self._draft_bars or self._draft_settled:
+            return
+        # Ship names vote as resolved names, so small OCR differences in
+        # the raw text still agree; team names vote on their own.
+        bans = []
+        for side, raw in read.bans:
+            hit = self.vocab.match(raw).ship
+            bans.append((side, raw, hit.name if hit else None))
+        key = ("bans", tuple((side, typ or UNMATCHED + raw) for side, raw, typ in bans))
+        self._draft_votes[key] += 1
+        for side in SIDES:
+            if read.teams[side]:
+                self._draft_votes[("team", side, self.teams.snap(read.teams[side]))] += 1
+        if self._draft_votes[key] < IDENTITY_VOTES:
+            return
+        teams = []
+        for side in SIDES:
+            votes = [(n, k[2]) for k, n in self._draft_votes.items() if k[:2] == ("team", side)]
+            teams.append(max(votes)[1] if votes else None)
+        if not all(teams):
+            return
+        self._draft_settled = True
+        self.draft = Draft(dict(zip(SIDES, teams)), bans, self._draft_seen)
+        log.info("draft: %s vs %s, bans %s", teams[0], teams[1],
+                 ", ".join(f"{typ or raw} ({side})" for side, raw, typ in bans))
+        self._log(None, *self._now(), "draft", {"teams": list(teams), "bans": [list(b) for b in bans]})
+
+    def _take_draft(self, m: MatchState, teams: dict[str, str | None],
+                    hud: dict[str, list[tuple[str, str | None]]]) -> list | None:
+        """The last draft, if it was recent and for this match.
+
+        Sides are matched by team name, not panel colour. Both names should
+        match, but the HUD's can be misread ("UNC KAPELLE") or stale (the
+        previous match's teams), so a draft whose banned ships agree with the
+        HUD's is also taken when one name matches, or when the HUD names are
+        no help at all.
+        """
+        d = self.draft
+        if d is None:
+            return None
+        if self._t is not None and self._t.offset - d.last_seen.offset > DRAFT_MAX_AGE_S:
+            return None
+        sides = {}
+        for dside, name in d.teams.items():
+            hits = [side for side in SIDES if same_team(name, teams[side])]
+            if len(hits) == 1:
+                sides[dside] = hits[0]
+        if len(set(sides.values())) < len(sides):
+            return None
+        if len(sides) < 2:
+            if len(sides) == 1:
+                (dside, side), = sides.items()
+                flip = dside != side
+            else:
+                flip = False
+            sides = {dside: OTHER[dside] if flip else dside for dside in SIDES}
+            if not self._draft_agrees(d, sides, hud):
+                return None
+        self.draft = None
+        m.draft_bans = [(sides[side], raw, typ, pick) for pick, (side, raw, typ) in enumerate(d.bans, 1)]
+        self._log(m, *self._now(), "bans_from_draft", {"bans": [list(b) for b in m.draft_bans]})
+        return m.draft_bans
+
+    def _reconcile_bans(self, drafted: list[tuple[str, str | None]],
+                        hud: list[tuple[str, str | None]]) -> list[tuple[str, str | None]]:
+        """Draft bans, with one ship the HUD read more clearly swapped in.
+
+        When the two lists differ by a single ship, one of them misread it
+        ("Rapler" on the panel resolving to Reaper, or "?agu" on the HUD), so
+        the read that matches the ship list better wins, in the draft's place.
+        """
+        names = lambda bans: Counter(typ or raw for raw, typ in bans)
+        only_draft = names(drafted) - names(hud)
+        only_hud = names(hud) - names(drafted)
+        if sum(only_draft.values()) != 1 or sum(only_hud.values()) != 1:
+            return drafted
+        i = next(i for i, (raw, typ) in enumerate(drafted) if (typ or raw) in only_draft)
+        h = next(b for b in hud if (b[1] or b[0]) in only_hud)
+        score = lambda b: self.vocab.match(b[0]).score if b[1] else 0.0
+        if score(h) > score(drafted[i]):
+            drafted = drafted[:i] + [h] + drafted[i + 1:]
+        return drafted
+
+    @staticmethod
+    def _draft_agrees(d: Draft, sides: dict[str, str], hud: dict[str, list]) -> bool:
+        """Do the draft's bans name the same ships as the HUD's lists? One
+        ship read wrong on either is allowed."""
+        if len(d.bans) < DRAFT_MIN_BANS_TO_AGREE:
+            return False
+        off = 0
+        for dside, side in sides.items():
+            want = Counter(typ or raw for s, raw, typ in d.bans if s == dside)
+            got = Counter(typ or raw for raw, typ in hud.get(side, []))
+            off += sum(((want - got) + (got - want)).values())
+        return off <= 2
+
     # ------------------------------------------------------------------- utils
+
+    def _now(self) -> tuple[str, float | None]:
+        t = self._t
+        return (iso(t.utc), t.offset) if t else (iso(datetime.now().astimezone()), None)
 
     def export(self, m: MatchState) -> dict:
         """The match as one observed-import object (see README), from memory."""
-        bans = [dict(side=side, ordinal=i, ship_type=typ, ship_raw=raw)
-                for side in SIDES for i, (raw, typ) in enumerate(m.bans.get(side, []), 1)]
+        bans = [dict(side=side, ordinal=i, pick=pick, ship_type=typ, ship_raw=raw)
+                for side in SIDES for i, (raw, typ, pick) in enumerate(m.bans.get(side, []), 1)]
         ship_keys = ("ship_type", "ship_raw", "pilot", "points", "died_match_s", "died_utc",
                      "match_confidence", "death_confidence")
         ships = [dict(side=side, slot=slot, **{k: fields.get(k) for k in ship_keys})

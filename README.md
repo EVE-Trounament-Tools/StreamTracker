@@ -2,7 +2,7 @@
 
 Watches an EVE Alliance Tournament broadcast on Twitch at 1 frame/sec. It tells match play apart from desk segments, ads and promos, and records each match to SQLite:
 - team names
-- ship bans (up to 10 per side)
+- ship bans (up to 10 per side), in pick order
 - every ship's type, pilot and points
 - when each ship dies
 
@@ -66,6 +66,7 @@ env/bin/stream-tracker replay runs/2873111426 --start 8:13:00 --db test.sqlite -
 | Clock, scores, PTS | Glyph template matching (`data/glyphs_*.npz`). Tesseract misreads the HUD's slashed zero as 8 |
 | Alive / dead | Row brightness: dead rows grey out and lose their health bars |
 | Names (teams, bans, ships, pilots) | Tesseract, run in a background thread until 3 reads agree, then locked |
+| Ban order | The pre-match draft panel (one card per ban, left to right, magenta = red, cyan = blue), found by its coloured bars |
 | Ship types | Fuzzy match against `data/ship_points.csv`; `N. X` / `F. X` / cut-off names are handled, and PTS breaks ties |
 
 A match ends when:
@@ -95,6 +96,13 @@ Death times:
 **Final scores** are taken as 200 minus the opponent's surviving points whenever every roster PTS was read, since the score digits can stop reading cleanly on a soft encode (AT XXI day 3 on YouTube). A disagreement with the last score read is logged as a `score_mismatch` event.
 
 **Bans** not in the ship list (e.g. Cenotaph in AT XXI) are kept as raw text with `ship_type = NULL`; the rest of that side's bans still resolve.
+
+**Ban order:** the HUD's "Ship Bans" lists aren't in pick order. Before each match the broadcast shows a draft panel with the bans in pick order, plus both team names. The tracker reads that panel while it is on screen, until 3 reads agree (it starts over if more cards appear, since the panel can fill in pick by pick). It then uses the panel for the next match within 30 minutes whose team names match it (sides are matched by name, not colour). Because HUD names can be misread ("UNC KAPELLE") or stale (the previous match's teams), the panel is also used when one name matches, or none does, as long as its banned ships agree with the HUD's (allowing one ship read wrong). When the panel and the HUD disagree on a single ship for a side, the read that matches the ship list better is kept, in the panel's position. In that case:
+- `bans.ordinal` follows pick order within each side;
+- `bans.pick` is the overall pick number across both sides (1..N);
+- a `bans_from_draft` event is logged, plus `draft_ban_mismatch` if a side's ships differ from the HUD's list (the panel still wins).
+
+If no matching panel was seen (e.g. the stream joined late, or an old `--save-hud` cache that didn't keep panel frames), the bans come from the HUD as before, top to bottom, with `pick = NULL`.
 
 `death_confidence` is one of:
 - `high`: the opponent's score equals 200 minus this side's surviving points (how AT scoring works). A side that brings under 200 points hands its opponent a head start, e.g. a 199-point roster means the opponent starts on 1.
