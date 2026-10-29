@@ -143,6 +143,7 @@ class MatchState:
     ended: bool = False
     end_reason: str | None = None
     series_id: int | None = None
+    match_no: int | None = None  # number within the tournament phase, from when it went live
     written_teams: dict[str, str | None] = field(default_factory=dict)  # provisional names in the DB
     # What has been written for this match, kept in memory so the finished
     # match can be sent on (observed import) without reading the DB back.
@@ -174,12 +175,16 @@ class Tracker:
         grace_s: float = 90.0,
         debug_dir: str | Path | None = None,
         run_id: str | None = None,
+        phase: str | None = None,
+        first_match: int = 1,
         on_match_end: Callable[[dict], None] | None = None,
     ):
         self.db = db
         self.channel = channel
         self.source = source
         self.run_id = run_id
+        self.phase = phase  # tournament phase sent with each import object; None lets the Feed card decide
+        self.first_match = first_match  # lowest number for this phase's next match (continues a phase across DBs)
         self.on_match_end = on_match_end  # called with each finished match's import object
         self.vocab = vocab or default_vocab()
         self.teams = TeamNames.from_file()
@@ -354,7 +359,7 @@ class Tracker:
     # ---------------------------------------------------------------- lifecycle
 
     def _open(self, frame: np.ndarray, t: FrameTime) -> MatchState:
-        mid = self.db.create_match(self.channel, self.source, iso(t.utc))
+        mid = self.db.create_match(self.channel, self.source, iso(t.utc), self.phase)
         self.match = MatchState(id=mid, team_crops=team_strip(frame), last_hud=t)
         self.match.row = dict(channel=self.channel, source=self.source, created_utc=iso(t.utc),
                               joined_late=0, status="pending")
@@ -474,8 +479,11 @@ class Tracker:
                 m.live_start_offset = first_t.offset - (MATCH_LENGTH_S - first_clock)
                 start = first_t.utc - timedelta(seconds=MATCH_LENGTH_S - first_clock)
                 late = not m.saw_countdown
+                # Numbered on going live, so abandoned and discarded matches use no number.
+                m.match_no = self.db.next_match_no(self.phase, self.first_match)
                 self._update(m, live_start_utc=iso(start), joined_late=int(late),
-                                     status="live")
+                             status="live", match_no=m.match_no)
+                log.info("match %d is %s match %d", m.id, self.phase or "phase-less", m.match_no)
                 self._event(t, "live", {"clock": first_clock, "joined_late": late})
         if r.phase in (Phase.PRE, Phase.COUNTDOWN, Phase.LIVE):
             m.phase = r.phase
@@ -912,7 +920,10 @@ class Tracker:
                      "match_confidence", "death_confidence")
         ships = [dict(side=side, slot=slot, **{k: fields.get(k) for k in ship_keys})
                  for (side, slot), fields in sorted(m.ships.items(), key=lambda kv: (kv[0][0] != "red", kv[0][1]))]
-        return dict(run_id=self.run_id, match_id=m.id, **m.row, bans=bans, ships=ships, events=list(m.events))
+        phase = {"phase": self.phase} if self.phase else {}
+        row = {k: v for k, v in m.row.items() if k != "match_no"}
+        return dict(run_id=self.run_id, match_id=m.match_no, **row, **phase, bans=bans, ships=ships,
+                    events=list(m.events))
 
     def _update(self, m: MatchState, **fields) -> None:
         self.db.update_match(m.id, **fields)

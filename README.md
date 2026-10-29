@@ -51,11 +51,15 @@ OBSERVED_IMPORT_TOKEN=...
 
 ```bash
 set -a; . ./.env; set +a
-env/bin/stream-tracker live eveonline --db at.sqlite --post --run-id at22-day1
+env/bin/stream-tracker live eveonline --db at.sqlite --post --run-id at22-day1 --phase Qualifiers
 env/bin/stream-tracker replay runs/2873111426 --start 8:13:00 --db test.sqlite --post
 ```
 
-`--run-id` and the local match id make the import key (`run_id:match_id`); posting the same match again replaces it. It defaults to the VOD id in a replay input, or `<channel>-<UTC date>` when live. Posts run in the background and retry server and network errors; a failure is logged and never stops tracking. `--start` and `--duration` also work on a `--save-hud` directory.
+`--run-id` and the match number make the import key (`run_id:match_id`); posting the same match again replaces it. It defaults to the VOD id in a replay input, or `<channel>-<UTC date>` when live. Posts run in the background and retry server and network errors; a failure is logged and never stops tracking. `--start` and `--duration` also work on a `--save-hud` directory.
+
+`--phase` (`Qualifiers`, `"Main Event"`, `Semi-Finals` or `Finals`) is sent with every match and decides its phase and ban count in the app (6 bans in the Qualifiers, 8 after). Without it the Feed card's phase applies. Reposting a match with the right `--phase` corrects one that landed under the wrong phase.
+
+Matches are numbered within their phase, in the order they go live (abandoned matches get no number), and that number is the `match_id` sent. The numbering continues from the highest number already in `--db` for that phase, so one database used every day keeps the prelims counting up across days. A day in its own database starts from `--first-match N` (e.g. `--first-match 35` when day 1 ended on match 34). The site builder labels matches the same way, counting on across the days it is given.
 
 ## How it works
 

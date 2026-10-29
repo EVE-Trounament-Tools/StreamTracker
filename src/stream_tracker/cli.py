@@ -18,6 +18,8 @@ from .importer import ImportClient
 from .tracker import Tracker
 from .vocab import update_ship_csv
 
+PHASES = ("Qualifiers", "Main Event", "Semi-Finals", "Finals")  # the observed-import phase names
+
 log = logging.getLogger("stream_tracker")
 
 
@@ -50,7 +52,8 @@ def make_tracker(args, source: str | None) -> tuple[Tracker, ImportClient | None
         client = ImportClient.from_env()
         log.info("posting finished matches to observed import as run %s", run_id)
     tracker = Tracker(Database(args.db), channel=args.channel, source=source, grace_s=args.grace,
-                      debug_dir=args.debug_dir, run_id=run_id,
+                      debug_dir=args.debug_dir, run_id=run_id, phase=args.phase,
+                      first_match=args.first_match,
                       on_match_end=client.submit if client else None)
     return tracker, client
 
@@ -169,6 +172,12 @@ def main(argv=None) -> None:
                        help="also send each finished match to the observed-import endpoint"
                             " (OBSERVED_IMPORT_URL and OBSERVED_IMPORT_TOKEN from the environment)")
         p.add_argument("--run-id", help="run id for --post (default: the VOD id, or channel-date when live)")
+        p.add_argument("--phase", choices=PHASES,
+                       help="tournament phase sent with --post (sets the ban count: 6 in Qualifiers, 8 after);"
+                            " default: the Feed card's phase")
+        p.add_argument("--first-match", type=int, default=1, metavar="N",
+                       help="number this phase's matches from N, to continue a phase begun in another"
+                            " database (default: one past the highest in --db)")
 
     p = sub.add_parser("live", help="track a live Twitch channel")
     p.add_argument("channel", help="channel name or stream URL")

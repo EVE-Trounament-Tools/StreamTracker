@@ -33,7 +33,9 @@ CREATE TABLE IF NOT EXISTS matches (
     tidi_overtime_s INTEGER,    -- play continued this long past the white 0:00 (time dilation)
     status TEXT NOT NULL,       -- pending | live | complete | abandoned
     series_id INTEGER REFERENCES series(id),
-    series_game INTEGER         -- 1-based game number within the series
+    series_game INTEGER,        -- 1-based game number within the series
+    phase TEXT,                 -- tournament phase (--phase), NULL when not given
+    match_no INTEGER            -- 1-based number within the phase, set when the match goes live
 );
 
 CREATE TABLE IF NOT EXISTS series (
@@ -91,7 +93,7 @@ CREATE TABLE IF NOT EXISTS events (
 # Columns added after the first release; ALTERed into older databases.
 MIGRATIONS = {
     "matches": [("series_id", "INTEGER REFERENCES series(id)"), ("series_game", "INTEGER"),
-                ("tidi_overtime_s", "INTEGER")],
+                ("tidi_overtime_s", "INTEGER"), ("phase", "TEXT"), ("match_no", "INTEGER")],
     "ships": [("died_clock_s", "INTEGER"), ("died_in_tidi", "INTEGER")],
     "bans": [("pick", "INTEGER")],
 }
@@ -151,12 +153,18 @@ class Database:
         self.conn.commit()
         return cur
 
-    def create_match(self, channel: str | None, source: str | None, created_utc: str) -> int:
+    def create_match(self, channel: str | None, source: str | None, created_utc: str,
+                     phase: str | None = None) -> int:
         cur = self._commit(
-            "INSERT INTO matches (channel, source, created_utc, status) VALUES (?, ?, ?, 'pending')",
-            (channel, source, created_utc),
+            "INSERT INTO matches (channel, source, created_utc, status, phase) VALUES (?, ?, ?, 'pending', ?)",
+            (channel, source, created_utc, phase),
         )
         return cur.lastrowid
+
+    def next_match_no(self, phase: str | None, first: int = 1) -> int:
+        """The next number in this phase: one past the highest so far, and at least `first`."""
+        last = self.conn.execute("SELECT MAX(match_no) FROM matches WHERE phase IS ?", (phase,)).fetchone()[0]
+        return max((last or 0) + 1, first)
 
     def delete_match(self, match_id: int) -> None:
         series_id = self._series_of(match_id)
