@@ -57,6 +57,8 @@ env/bin/stream-tracker replay runs/2873111426 --start 8:13:00 --db test.sqlite -
 
 `--run-id` and the match number make the import key (`run_id:match_id`); posting the same match again replaces it. It defaults to the VOD id in a replay input, or `<channel>-<UTC date>` when live. Posts run in the background and retry server and network errors; a failure is logged and never stops tracking. `--start` and `--duration` also work on a `--save-hud` directory.
 
+Each match also gets a `vod_url`, stored in `--db` and sent with the match: the Twitch VOD at the moment the match clock started (`https://www.twitch.tv/videos/<id>?t=1h2m5s`). It is filled for replays only, from the VOD id in the input or `--vod-url` when the input isn't named by it. Live tracking leaves it empty, since live offsets count from when tracking began; replay the VOD afterwards with `--post` to fill it in.
+
 `--phase` (`Qualifiers`, `"Main Event"`, `Semi-Finals` or `Finals`) is sent with every match and decides its phase and ban count in the app (6 bans in the Qualifiers, 8 after). Without it the Feed card's phase applies. Reposting a match with the right `--phase` corrects one that landed under the wrong phase.
 
 Matches are numbered within their phase, in the order they go live (abandoned matches get no number), and that number is the `match_id` sent. The numbering continues from the highest number already in `--db` for that phase, so one database used every day keeps the prelims counting up across days. A day in its own database starts from `--first-match N` (e.g. `--first-match 35` when day 1 ended on match 34). The site builder labels matches the same way, counting on across the days it is given.
@@ -89,7 +91,7 @@ Death times:
 - `died_utc` and `died_stream_offset_s`: absolute and stream time.
 
 **Things the tracker works around:**
-- **Look-alike ads:** overlay shown for under 25s is dropped, and a mid-match overlay with other teams or an inconsistent clock is ignored for up to 25s.
+- **Look-alike ads:** overlay shown for under 25s is dropped, and a mid-match overlay with other teams or an inconsistent clock is ignored for up to 25s. Longer ads replay a match clip that starts mid-clock and cuts away: a match never seen counting down whose HUD is lost within 2 minutes is dropped too (AT XXI day 3, 7:31:44 and 8:10:46). Real matches the broadcast cut away from had their countdown and ran 5+ minutes.
 - **Caster graphics over the overlay:** names only count when 3 reads agree.
 - **Faded or dimmed overlay:** alive/dead is judged relative to the column headings' brightness.
 - **Stale overlay showing both teams wiped:** ignored.

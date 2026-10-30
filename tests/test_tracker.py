@@ -9,7 +9,8 @@ import numpy as np
 from stream_tracker import reader
 from stream_tracker.db import Database
 from stream_tracker.reader import Identity
-from stream_tracker.tracker import MIN_MATCH_HUD_FRAMES, FrameTime, MatchState, Tracker
+from stream_tracker.tracker import (MIN_LATE_JOIN_HUD_FRAMES, MIN_MATCH_HUD_FRAMES, FrameTime, MatchState,
+                                   Tracker)
 from stream_tracker.vocab import ShipVocab, load_ships
 
 T0 = datetime(2026, 10, 18, 15, 0, tzinfo=timezone.utc)
@@ -130,7 +131,8 @@ def test_foreign_hud_mid_match_is_ignored(frame, tmp_path, running_clock):
 def test_hud_lost_ends_after_grace(frame, tmp_path, running_clock):
     db_path = tmp_path / "t.sqlite"
     tracker = Tracker(Database(db_path), grace_s=10)
-    feed(tracker, live_frames(frame) + [(670 + i, frame(400)) for i in range(15)])
+    n = MIN_LATE_JOIN_HUD_FRAMES + 5  # joined late, so shorter would be taken for a match-clip ad
+    feed(tracker, live_frames(frame, n=n) + [(640 + n + i, frame(400)) for i in range(15)])
     (m,) = rows(db_path, "SELECT * FROM matches")
     assert m["end_reason"] == "hud_lost"
 
@@ -240,6 +242,22 @@ def test_abandoned_match_keeps_team_colours(tmp_path):
     (row,) = rows(db_path, "SELECT * FROM matches")
     assert row["status"] == "abandoned" and row["match_no"] is None  # never went live: no number
     assert (row["red_team"], row["blue_team"]) == ("SEDITION.", "NEON NIGHTMARES")
+
+
+@pytest.mark.parametrize("hud_frames, saw_countdown, kept", [
+    (60, False, False),  # a match-clip ad: joined mid-clock, cut away after a minute
+    (MIN_LATE_JOIN_HUD_FRAMES, False, True),  # a real match joined late
+    (60, True, True),  # counted down, then the broadcast cut away
+])
+def test_late_joined_clip_is_an_ad(tmp_path, hud_frames, saw_countdown, kept):
+    db_path, tracker, m = _hand_match(tmp_path)
+    tracker.match = m
+    m.hud_frames, m.saw_countdown, m.live_started = hud_frames, saw_countdown, True
+    m.last_hud = FrameTime(T0, 0)
+    later = tracker.grace_s + 1
+    tracker._on_no_hud(FrameTime(T0 + timedelta(seconds=later), later))
+    found = rows(db_path, "SELECT end_reason FROM matches")
+    assert found == ([{"end_reason": "hud_lost"}] if kept else [])
 
 
 def test_points_not_taken_from_ship_list(frame, tmp_path):
