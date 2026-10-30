@@ -61,6 +61,8 @@ Each match also gets a `vod_url`, stored in `--db` and sent with the match: the 
 
 `--phase` (`Qualifiers`, `"Main Event"`, `Semi-Finals` or `Finals`) is sent with every match and decides its phase and ban count in the app (6 bans in the Qualifiers, 8 after). Without it the Feed card's phase applies. Reposting a match with the right `--phase` corrects one that landed under the wrong phase.
 
+Outside the Qualifiers (any other `--phase`), every team is known in advance, so team names are best-fit to the tournament's own spelling before they are stored and sent. That covers names the overlay cuts off (`XQTY`, `34-YRS-OLD MEN`), shortens (`THE BLUE.`) or misreads (`UNC KAPELLE`). The known teams come from `--teams FILE` (default `data/known_teams.txt`, AT XXII). The file has one team per line with optional `| alias` entries, or it can be a tournament JSON with a `teams` list. Without `--phase`, or with `Qualifiers`, names are kept as read.
+
 Matches are numbered within their phase, in the order they go live (abandoned matches get no number), and that number is the `match_id` sent. The numbering continues from the highest number already in `--db` for that phase, so one database used every day keeps the prelims counting up across days. A day in its own database starts from `--first-match N` (e.g. `--first-match 35` when day 1 ended on match 34). The site builder labels matches the same way, counting on across the days it is given.
 
 ## How it works

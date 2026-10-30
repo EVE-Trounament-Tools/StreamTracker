@@ -30,7 +30,7 @@ from . import draft, layout as L, reader
 from .db import Database
 from .hud import Phase
 from .reader import SIDES, FrameReading, Identity
-from .vocab import TEAM_SNAP_SCORE, ShipVocab, TeamNames, default_vocab
+from .vocab import KNOWN_TEAMS_FILE, TEAM_SNAP_SCORE, KnownTeams, ShipVocab, TeamNames, default_vocab
 
 log = logging.getLogger(__name__)
 
@@ -83,6 +83,9 @@ class Draft:
     teams: dict[str, str]
     bans: list[tuple[str, str, str | None]]  # (side, raw, ship_type) in pick order
     last_seen: FrameTime
+
+
+PRELIM_PHASE = "Qualifiers"
 
 
 def same_team(a: str | None, b: str | None) -> bool:
@@ -190,6 +193,7 @@ class Tracker:
         phase: str | None = None,
         first_match: int = 1,
         vod: str | None = None,
+        known_teams: Path = KNOWN_TEAMS_FILE,
         on_match_end: Callable[[dict], None] | None = None,
     ):
         self.db = db
@@ -202,6 +206,9 @@ class Tracker:
         self.on_match_end = on_match_end  # called with each finished match's import object
         self.vocab = vocab or default_vocab()
         self.teams = TeamNames.from_file()
+        # Past the Qualifiers every team is known, so names are best-fit to the tournament's spelling.
+        self.known_teams = (KnownTeams.from_file(Path(known_teams))
+                            if phase not in (None, PRELIM_PHASE) else None)
         for row in db.conn.execute("SELECT red_team, blue_team FROM matches"):
             for name in row:
                 self.teams.add(name)
@@ -732,9 +739,18 @@ class Tracker:
         for side in SIDES:
             c = m.votes.get(("team", side))
             teams[side] = self.teams.snap(c.most_common(1)[0][0]) if c else None
+        teams = self._fit_teams(teams)
         if teams != m.written_teams:
             m.written_teams = teams
             self._update(m, red_team=teams["red"], blue_team=teams["blue"])
+
+    def _fit_teams(self, teams: dict[str, str | None]) -> dict[str, str | None]:
+        """Team names as stored and sent: best-fit to the known teams outside
+        the Qualifiers, else as read."""
+        if self.known_teams is None:
+            return teams
+        red, blue = self.known_teams.fit_pair(teams["red"], teams["blue"])
+        return {"red": red, "blue": blue}
 
     def _settle_identity(self, m: MatchState) -> None:
         m.identity_settled = True
@@ -746,7 +762,8 @@ class Tracker:
         teams = {side: self.teams.snap(best(("team", side))) for side in SIDES}
         for name in teams.values():
             self.teams.add(name)
-        self._update(m, red_team=teams["red"], blue_team=teams["blue"])
+        fitted = self._fit_teams(teams)  # the HUD spellings stay in teams, for matching the draft panel
+        self._update(m, red_team=fitted["red"], blue_team=fitted["blue"])
         hud = {}
         for side in SIDES:
             names = best(("bans", side))

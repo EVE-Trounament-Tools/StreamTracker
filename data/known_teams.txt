@@ -1,0 +1,61 @@
+# AT XXII teams as the tournament spells them, for best-fitting HUD names
+# outside the Qualifiers (KnownTeams). "name | alias | ..." maps overlay names
+# that look nothing like the team's.
+34-yrs-old men get nagged by wives for playing EVE
+Arctic Light
+Brave Collective
+Bright Side of Death
+Catlas Tor Love Appreciation Society UseCodeWIZARD | HIDDEN LEAF VILLAGE NINJA AssAssIn SQUAD eSports Team
+Critical. Mass.
+D-sync.
+DarkSide.
+Deteriorated
+Dracarys.
+Exodus.
+Fraternity.
+Honkai Star Rail.
+IIIIIIIIIIIIIIIIIIIIIIIIIII | TEETH | EEE | ST
+Ivy League
+Kitchen Sinkhole
+L A Z E R H A W K S
+Meta Reloaded
+Minmatar Fleet Alliance
+Neon Nightmares
+NO NEED LOOSE FACE
+NPSI.Rocks
+Odin's Call
+Of Essence
+OnlyFleets.
+Out of the Blue.
+Paper Numbers
+Platinum Sensitivity.
+Project Potato
+Psychokids.
+PSYCHOTIC OVERHEAT
+Psyno Theory
+Punishing Gray Raven
+Ragequit Cancel Sub
+Rote Kapelle
+Rusty Hyenas Clan
+Sedition.
+Seker Matar
+Seriously Suspicious
+Shadow Cartel
+Sigma Grindset
+Slide On Contact
+Solyaris Chtonium
+SONS of BANE
+Space Violence.
+Test Alliance Please Ignore
+That Escalated Quickly.
+The Excommunicati
+The Initiative.
+The Obsidian Front - Reborn
+The Skeleton Crew
+The Tuskers Co.
+Vapor-Lock
+WE FORM V0LTA
+We Forsakened Few
+White Squall.
+xqtywiznalamywmodxfhhopawzpqyjdwrpeptuaenabjawdzku
+ZERG REBORN
