@@ -426,3 +426,21 @@ def test_clearer_read_wins_a_one_ship_disagreement(monkeypatch, tmp_path):
         tracker._vote(m, _identity(red_bans=("Huginn", "Rapier"), blue_bans=("?agu", "Eos")))
     bans = rows(db_path, "SELECT ship_type, pick FROM bans ORDER BY pick")
     assert [(b["ship_type"], b["pick"]) for b in bans] == [("Rapier", 1), ("Magus", 2), ("Huginn", 3), ("Eos", 4)]
+
+
+@pytest.mark.parametrize("phase, stored", [
+    (None, "XQTY"),
+    ("Qualifiers", "XQTY"),
+    ("Main Event", "xqtywiznalamywmodxfhhopawzpqyjdwrpeptuaenabjawdzku"),
+])
+def test_team_names_best_fit_only_past_the_qualifiers(tmp_path, phase, stored):
+    db_path = tmp_path / "t.sqlite"
+    db = Database(db_path)
+    tracker = Tracker(db, phase=phase)
+    m = MatchState(id=db.create_match(None, None, T0.isoformat(), phase), team_crops=np.zeros((1, 1), np.float32))
+    for _ in range(3):
+        tracker._vote(m, _identity(red="XQTY", blue="SEKER MATAR"))
+    assert m.identity_settled
+    row = rows(db_path, "SELECT red_team, blue_team FROM matches")[0]
+    assert row["red_team"] == stored
+    assert row["blue_team"] == ("SEKER MATAR" if phase in (None, "Qualifiers") else "Seker Matar")

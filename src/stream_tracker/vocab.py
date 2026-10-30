@@ -150,6 +150,86 @@ class TeamNames:
         return hit[0] if hit else name
 
 
+KNOWN_TEAMS_FILE = DATA_DIR / "known_teams.txt"
+BEST_FIT_MIN = 60
+PREFIX_MIN = 4  # a cut-off name must keep this many characters to count as a prefix
+
+
+def _team_words(name: str) -> list[str]:
+    """Upper-case words, slashed zero read as O, punctuation dropped."""
+    return re.sub(r"[^A-Z0-9 ]", " ", name.upper().replace("0", "O")).split()
+
+
+class KnownTeams:
+    """Best-fits a team name to the tournament's own spelling of it.
+
+    Unlike TeamNames.snap, which only fixes near-identical OCR slips, this
+    always picks the closest known team, so it only suits a phase whose
+    teams are all known in advance (not the Qualifiers). It handles names
+    the overlay cuts off ("XQTY", "34-YRS-OLD MEN"), shortens ("CATLAS TOR
+    USECODEWIZARD", "THE BLUE.") or letter-spaces ("L A Z E R H A W K S"),
+    plus aliases for overlay names that look nothing like the team's
+    ("TEETH" for "IIIIIIII…").
+
+    The file has one team per line, its spelling as the tournament has it,
+    optionally followed by " | alias | alias…"; lines starting with # are
+    comments. A tournament JSON (a "teams" list of {"name": …}) also works.
+    """
+
+    def __init__(self, names: list[str], aliases: dict[str, str] | None = None):
+        self.names = names
+        self.aliases = {"".join(_team_words(a)): n for a, n in (aliases or {}).items()}
+        self._keys = {n: ("".join(_team_words(n)), " ".join(_team_words(n))) for n in names}
+
+    @classmethod
+    def from_file(cls, path: Path = KNOWN_TEAMS_FILE) -> "KnownTeams":
+        if path.suffix == ".json":
+            import json
+            return cls([t["name"] for t in json.loads(path.read_text())["teams"]])
+        names, aliases = [], {}
+        for line in path.read_text().splitlines():
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            name, *alts = (part.strip() for part in line.split("|"))
+            names.append(name)
+            aliases.update({a: name for a in alts if a})
+        return cls(names, aliases)
+
+    def score(self, name: str, known: str) -> float:
+        squashed, words = "".join(_team_words(name)), " ".join(_team_words(name))
+        k_squashed, k_words = self._keys[known]
+        best = fuzz.ratio(squashed, k_squashed)
+        if len(squashed) >= PREFIX_MIN and k_squashed.startswith(squashed):
+            best = max(best, 95)
+        # every word of the name in the team's ("THE BLUE." in "OUT OF THE BLUE.")
+        return max(best, 0.95 * fuzz.token_set_ratio(words, k_words))
+
+    def fit(self, name: str | None, exclude: tuple[str | None, ...] = ()) -> str | None:
+        """The known team closest to name, else name unchanged when nothing
+        scores BEST_FIT_MIN. Teams in exclude (the other side's) are skipped."""
+        if not name or not self.names:
+            return name
+        alias = self.aliases.get("".join(_team_words(name)))
+        if alias and alias not in exclude:
+            return alias
+        scored = [(self.score(name, k), k) for k in self.names if k not in exclude]
+        if not scored:
+            return name
+        score, best = max(scored)
+        return best if score >= BEST_FIT_MIN else name
+
+    def fit_pair(self, red: str | None, blue: str | None) -> tuple[str | None, str | None]:
+        """Fit both sides, never to the same team: the clearer read picks first."""
+        if not (red and blue):
+            return self.fit(red), self.fit(blue)
+        r, b = self.fit(red), self.fit(blue)
+        if r != b:
+            return r, b
+        if self.score(red, r) >= self.score(blue, b):
+            return r, self.fit(blue, exclude=(r,))
+        return self.fit(red, exclude=(b,)), b
+
+
 @lru_cache(maxsize=1)
 def default_vocab() -> ShipVocab:
     return ShipVocab(load_ships())

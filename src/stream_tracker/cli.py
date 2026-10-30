@@ -16,7 +16,7 @@ from .capture import FileSource, HudRecorder, LiveSource, StripCache, resolve_vo
 from .db import Database
 from .importer import ImportClient
 from .tracker import Tracker
-from .vocab import update_ship_csv
+from .vocab import KNOWN_TEAMS_FILE, update_ship_csv
 
 PHASES = ("Qualifiers", "Main Event", "Semi-Finals", "Finals")  # the observed-import phase names
 
@@ -69,7 +69,7 @@ def make_tracker(args, source: str | None) -> tuple[Tracker, ImportClient | None
         log.info("posting finished matches to observed import as run %s", run_id)
     tracker = Tracker(Database(args.db), channel=args.channel, source=source, grace_s=args.grace,
                       debug_dir=args.debug_dir, run_id=run_id, phase=args.phase,
-                      first_match=args.first_match, vod=vod_for(args),
+                      first_match=args.first_match, vod=vod_for(args), known_teams=args.teams,
                       on_match_end=client.submit if client else None)
     return tracker, client
 
@@ -194,6 +194,9 @@ def main(argv=None) -> None:
         p.add_argument("--first-match", type=int, default=1, metavar="N",
                        help="number this phase's matches from N, to continue a phase begun in another"
                             " database (default: one past the highest in --db)")
+        p.add_argument("--teams", type=Path, default=KNOWN_TEAMS_FILE, metavar="FILE",
+                       help="known teams (one per line, or a tournament JSON) that team names are best-fit"
+                            " to outside the Qualifiers (default: data/known_teams.txt)")
 
     p = sub.add_parser("live", help="track a live Twitch channel")
     p.add_argument("channel", help="channel name or stream URL")
