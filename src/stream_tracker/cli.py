@@ -31,14 +31,30 @@ def parse_time(text: str) -> float:
     return total
 
 
+def vod_id(text: str) -> str | None:
+    """The Twitch VOD id in a replay input: a videos/<id> URL, or a file or directory named with it."""
+    m = re.search(r"(\d{6,})", Path(text.rstrip("/")).name) or re.search(r"videos/(\d+)", text)
+    return m.group(1) if m else None
+
+
 def run_id_for(args) -> str | None:
     """--run-id, else the VOD id in a replay input, else <channel>-<UTC date> when live."""
     if args.run_id:
         return args.run_id
     if args.cmd == "live":
         return f"{args.channel.rstrip('/').split('/')[-1]}-{datetime.now(timezone.utc):%Y%m%d}"
-    m = re.search(r"(\d{6,})", Path(args.input.rstrip("/")).name) or re.search(r"videos/(\d+)", args.input)
-    return m.group(1) if m else None
+    return vod_id(args.input)
+
+
+def vod_for(args) -> str | None:
+    """--vod-url, else the Twitch VOD of a replay input. None when live: its offsets
+    count from when tracking started, not from the start of any VOD."""
+    if args.cmd == "live":
+        return None
+    if args.vod_url:
+        return args.vod_url
+    vid = vod_id(args.input)
+    return f"https://www.twitch.tv/videos/{vid}" if vid else None
 
 
 def make_tracker(args, source: str | None) -> tuple[Tracker, ImportClient | None]:
@@ -53,7 +69,7 @@ def make_tracker(args, source: str | None) -> tuple[Tracker, ImportClient | None
         log.info("posting finished matches to observed import as run %s", run_id)
     tracker = Tracker(Database(args.db), channel=args.channel, source=source, grace_s=args.grace,
                       debug_dir=args.debug_dir, run_id=run_id, phase=args.phase,
-                      first_match=args.first_match,
+                      first_match=args.first_match, vod=vod_for(args),
                       on_match_end=client.submit if client else None)
     return tracker, client
 
@@ -193,6 +209,8 @@ def main(argv=None) -> None:
     p.add_argument("--realtime", action="store_true", help="read at playback speed")
     p.add_argument("--start-utc", help="ISO time of the input's start, for absolute timestamps")
     p.add_argument("--channel")
+    p.add_argument("--vod-url", help="Twitch VOD the input is a copy of, for each match's vod_url"
+                                     " (default: from the VOD id in the input)")
     common(p)
     p.set_defaults(func=cmd_replay)
 

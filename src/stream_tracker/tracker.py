@@ -56,6 +56,11 @@ SAME_TEAMS_MIN_CORR = 0.9
 # screen for less than this in total is discarded.
 FOREIGN_MAX_FRAMES = 25
 MIN_MATCH_HUD_FRAMES = 25
+# Longer ads replay a match clip: they start mid-clock with no countdown and
+# cut away after a minute or so. A match that was never seen counting down and
+# loses its HUD within this many HUD frames is one of those. Real matches cut
+# off by the broadcast had their countdown and ran for 5+ minutes (AT XXI/XXII).
+MIN_LATE_JOIN_HUD_FRAMES = 120
 CLOCK_TOLERANCE_S = 3
 # The pre-match draft panel gives the bans in pick order. It is used for the
 # next match between its teams if that starts within this long of the panel
@@ -93,6 +98,13 @@ def same_team(a: str | None, b: str | None) -> bool:
 
 def iso(t: datetime) -> str:
     return t.isoformat(timespec="seconds")
+
+
+def vod_link(base: str, offset: float) -> str:
+    """A Twitch VOD URL that opens `offset` seconds in, e.g. ...?t=1h2m5s."""
+    s = max(0, int(offset))
+    sep = "&" if "?" in base else "?"
+    return f"{base}{sep}t={s // 3600}h{s % 3600 // 60}m{s % 60}s"
 
 
 @dataclass
@@ -177,6 +189,7 @@ class Tracker:
         run_id: str | None = None,
         phase: str | None = None,
         first_match: int = 1,
+        vod: str | None = None,
         on_match_end: Callable[[dict], None] | None = None,
     ):
         self.db = db
@@ -185,6 +198,7 @@ class Tracker:
         self.run_id = run_id
         self.phase = phase  # tournament phase sent with each import object; None lets the Feed card decide
         self.first_match = first_match  # lowest number for this phase's next match (continues a phase across DBs)
+        self.vod = vod  # Twitch VOD URL the offsets are into; None when live
         self.on_match_end = on_match_end  # called with each finished match's import object
         self.vocab = vocab or default_vocab()
         self.teams = TeamNames.from_file()
@@ -367,15 +381,19 @@ class Tracker:
         log.info("match %d opened at %.0fs", mid, t.offset)
         return self.match
 
-    def _discard_if_brief(self, m: MatchState) -> bool:
-        """Delete a match whose HUD was barely on screen (an ad, not a match)."""
-        if m.hud_frames >= MIN_MATCH_HUD_FRAMES:
+    def _discard_if_brief(self, m: MatchState, reason: str | None = None) -> bool:
+        """Delete a match whose HUD was barely on screen (an ad, not a match):
+        under MIN_MATCH_HUD_FRAMES, or a late-joined clip that lost the HUD
+        within MIN_LATE_JOIN_HUD_FRAMES."""
+        clip = reason == "hud_lost" and not m.saw_countdown and m.hud_frames < MIN_LATE_JOIN_HUD_FRAMES
+        if m.hud_frames >= MIN_MATCH_HUD_FRAMES and not clip:
             return False
         if self._identity_job is not None:
             wait([self._identity_job])
             self._identity_job = None
         self.db.delete_match(m.id)
-        log.info("match %d discarded: HUD on screen for only %ds", m.id, m.hud_frames)
+        log.info("match %d discarded: HUD on screen for only %ds%s", m.id, m.hud_frames,
+                 " after joining mid-clock (a match-clip ad)" if clip else "")
         if self.match is m:
             self.match = None
         return True
@@ -395,7 +413,7 @@ class Tracker:
 
     def _end(self, t: FrameTime, reason: str) -> None:
         m = self.match
-        if self._discard_if_brief(m):
+        if self._discard_if_brief(m, reason):
             return
         self._finish_identity(m)
         m.ended = True
@@ -481,8 +499,9 @@ class Tracker:
                 late = not m.saw_countdown
                 # Numbered on going live, so abandoned and discarded matches use no number.
                 m.match_no = self.db.next_match_no(self.phase, self.first_match)
+                vod = {"vod_url": vod_link(self.vod, m.live_start_offset)} if self.vod else {}
                 self._update(m, live_start_utc=iso(start), joined_late=int(late),
-                             status="live", match_no=m.match_no)
+                             status="live", match_no=m.match_no, **vod)
                 log.info("match %d is %s match %d", m.id, self.phase or "phase-less", m.match_no)
                 self._event(t, "live", {"clock": first_clock, "joined_late": late})
         if r.phase in (Phase.PRE, Phase.COUNTDOWN, Phase.LIVE):

@@ -1,13 +1,15 @@
 import json
+from datetime import datetime
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 
+from stream_tracker import cli
 from stream_tracker.cli import main
 from stream_tracker.db import Database
 from stream_tracker.importer import ImportClient
-from stream_tracker.tracker import FrameTime, MatchState, Tracker
+from stream_tracker.tracker import FrameTime, MatchState, Tracker, vod_link
 
 from test_tracker import T0, feed
 
@@ -124,3 +126,37 @@ def test_finished_match_is_exported_from_memory(frame, tmp_path):
     assert [e["kind"] for e in m["events"]] == [r["kind"] for r in db.conn.execute(
         "SELECT kind FROM events WHERE match_id = 1 ORDER BY id")]
     json.dumps(m)
+
+
+def test_vod_url_points_at_live_start(frame, tmp_path):
+    db = Database(tmp_path / "t.sqlite")
+    (m,) = record_match(frame, db, vod="https://www.twitch.tv/videos/42")
+    (row,) = db.conn.execute("SELECT live_start_utc, vod_url FROM matches").fetchall()
+    assert m["vod_url"] == row["vod_url"]
+    start = (datetime.fromisoformat(row["live_start_utc"]) - T0).total_seconds()
+    assert row["vod_url"] == vod_link("https://www.twitch.tv/videos/42", start)
+
+
+def test_no_vod_no_url(frame, tmp_path):
+    (m,) = record_match(frame, Database(tmp_path / "t.sqlite"))
+    assert m.get("vod_url") is None
+
+
+@pytest.mark.parametrize("offset, want", [(0, "?t=0h0m0s"), (3725.6, "?t=1h2m5s"), (-12, "?t=0h0m0s")])
+def test_vod_link(offset, want):
+    assert vod_link("https://www.twitch.tv/videos/1", offset) == "https://www.twitch.tv/videos/1" + want
+
+
+@pytest.mark.parametrize("argv, want", [
+    (["replay", "https://www.twitch.tv/videos/2859664382"], "https://www.twitch.tv/videos/2859664382"),
+    (["replay", "runs/2859664382.mp4"], "https://www.twitch.tv/videos/2859664382"),
+    (["replay", "cache", "--vod-url", "https://www.twitch.tv/videos/7"], "https://www.twitch.tv/videos/7"),
+    (["replay", "x.mp4"], None),
+    (["live", "eveonline"], None),
+])
+def test_vod_for(argv, want, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(cli, "cmd_replay", lambda args: seen.setdefault("vod", cli.vod_for(args)))
+    monkeypatch.setattr(cli, "cmd_live", lambda args: seen.setdefault("vod", cli.vod_for(args)))
+    cli.main(argv)
+    assert seen["vod"] == want

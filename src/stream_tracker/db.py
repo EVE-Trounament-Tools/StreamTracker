@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS matches (
     series_id INTEGER REFERENCES series(id),
     series_game INTEGER,        -- 1-based game number within the series
     phase TEXT,                 -- tournament phase (--phase), NULL when not given
-    match_no INTEGER            -- 1-based number within the phase, set when the match goes live
+    match_no INTEGER,           -- 1-based number within the phase, set when the match goes live
+    vod_url TEXT                -- Twitch VOD link at the match's live start; replays only
 );
 
 CREATE TABLE IF NOT EXISTS series (
@@ -93,7 +94,8 @@ CREATE TABLE IF NOT EXISTS events (
 # Columns added after the first release; ALTERed into older databases.
 MIGRATIONS = {
     "matches": [("series_id", "INTEGER REFERENCES series(id)"), ("series_game", "INTEGER"),
-                ("tidi_overtime_s", "INTEGER"), ("phase", "TEXT"), ("match_no", "INTEGER")],
+                ("tidi_overtime_s", "INTEGER"), ("phase", "TEXT"), ("match_no", "INTEGER"),
+                ("vod_url", "TEXT")],
     "ships": [("died_clock_s", "INTEGER"), ("died_in_tidi", "INTEGER")],
     "bans": [("pick", "INTEGER")],
 }
