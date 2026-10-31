@@ -103,6 +103,13 @@ def iso(t: datetime) -> str:
     return t.isoformat(timespec="seconds")
 
 
+def channel_url(channel: str | None) -> str:
+    """The Twitch channel page, the placeholder vod_url sent for live matches."""
+    if channel and "://" in channel:
+        return channel
+    return f"https://www.twitch.tv/{channel or ''}"
+
+
 def vod_link(base: str, offset: float) -> str:
     """A Twitch VOD URL that opens `offset` seconds in, e.g. ...?t=1h2m5s."""
     s = max(0, int(offset))
@@ -958,6 +965,11 @@ class Tracker:
                  for (side, slot), fields in sorted(m.ships.items(), key=lambda kv: (kv[0][0] != "red", kv[0][1]))]
         phase = {"phase": self.phase} if self.phase else {}
         row = {k: v for k, v in m.row.items() if k != "match_no"}
+        if self.source == "live" and not row.get("vod_url"):
+            # The endpoint requires a vod_url, but live offsets can't point into a VOD
+            # that doesn't exist yet. Send the channel as a placeholder (the DB keeps
+            # NULL); replaying the VOD with --post later replaces it with the real link.
+            row["vod_url"] = channel_url(self.channel)
         return dict(run_id=self.run_id, match_id=m.match_no, **row, **phase, bans=bans, ships=ships,
                     events=list(m.events))
 

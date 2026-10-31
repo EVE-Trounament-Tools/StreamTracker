@@ -142,6 +142,16 @@ def test_no_vod_no_url(frame, tmp_path):
     assert m.get("vod_url") is None
 
 
+def test_live_sends_channel_as_placeholder_vod_url(frame, tmp_path):
+    db = Database(tmp_path / "t.sqlite")
+    sent = []
+    tracker = Tracker(db, channel="fenriscreations", source="live", run_id="x", on_match_end=sent.append)
+    feed(tracker, [(t, frame(src)) for t, src in MATCH_SEQ])
+    tracker.close(FrameTime(T0, 1300))
+    assert sent[0]["vod_url"] == "https://www.twitch.tv/fenriscreations"
+    assert db.conn.execute("SELECT vod_url FROM matches").fetchone()["vod_url"] is None
+
+
 @pytest.mark.parametrize("offset, want", [(0, "?t=0h0m0s"), (3725.6, "?t=1h2m5s"), (-12, "?t=0h0m0s")])
 def test_vod_link(offset, want):
     assert vod_link("https://www.twitch.tv/videos/1", offset) == "https://www.twitch.tv/videos/1" + want

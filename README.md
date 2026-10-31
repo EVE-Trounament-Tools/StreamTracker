@@ -57,7 +57,7 @@ env/bin/stream-tracker replay runs/2873111426 --start 8:13:00 --db test.sqlite -
 
 `--run-id` and the match number make the import key (`run_id:match_id`); posting the same match again replaces it. It defaults to the VOD id in a replay input, or `<channel>-<UTC date>` when live. Posts run in the background and retry server and network errors; a failure is logged and never stops tracking. `--start` and `--duration` also work on a `--save-hud` directory.
 
-Each match also gets a `vod_url`, stored in `--db` and sent with the match: the Twitch VOD at the moment the match clock started (`https://www.twitch.tv/videos/<id>?t=1h2m5s`). It is filled for replays only, from the VOD id in the input or `--vod-url` when the input isn't named by it. Live tracking leaves it empty, since live offsets count from when tracking began; replay the VOD afterwards with `--post` to fill it in.
+Each match also gets a `vod_url`, stored in `--db` and sent with the match: the Twitch VOD at the moment the match clock started (`https://www.twitch.tv/videos/<id>?t=1h2m5s`). It is filled for replays only, from the VOD id in the input or `--vod-url` when the input isn't named by it. Live tracking leaves it empty in `--db`, since live offsets count from when tracking began, but posts the channel page (`https://www.twitch.tv/<channel>`) as a placeholder because the endpoint requires one. Replay the VOD afterwards with `--post` to replace it with the real link.
 
 `--phase` (`Qualifiers`, `"Main Event"`, `Semi-Finals` or `Finals`) is sent with every match and decides its phase and ban count in the app (6 bans in the Qualifiers, 8 after). Without it the Feed card's phase applies. Reposting a match with the right `--phase` corrects one that landed under the wrong phase.
 
