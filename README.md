@@ -65,6 +65,21 @@ Outside the Qualifiers (any other `--phase`), every team is known in advance, so
 
 Matches are numbered within their phase, in the order they go live (abandoned matches get no number), and that number is the `match_id` sent. The numbering continues from the highest number already in `--db` for that phase, so one database used every day keeps the prelims counting up across days. A day in its own database starts from `--first-match N` (e.g. `--first-match 35` when day 1 ended on match 34). The site builder labels matches the same way, counting on across the days it is given.
 
+### Linking deaths to zKillboard killmails
+
+```bash
+# afterwards, on any databases
+env/bin/stream-tracker zkill runs/atxxii-finals.sqlite [--tolerance 60] [--offset -5]
+# or while tracking: each match is checked as it ends (live: again after 3, 10 and 30 min, until all are linked)
+env/bin/stream-tracker live eveonline --db at.sqlite --zkill
+```
+
+Killmails come from zKillboard's region 10000004 (UUA-F4, `--region`), with names from ESI. They are cached in a `killmails` table, so re-runs only fetch what's new. Each death is linked to the killmail with the same ship type and a similar pilot name (allowing for OCR slips and `…` truncation) that is **closest in time**, so a pilot who dies in several matches that day gets the right kill each time. A death whose closest killmail is still more than `--tolerance` seconds off stays unlinked. Not every AT kill reaches zKill (none of AT XXII's earlier days did).
+
+`died_utc` trails the game by the stream delay (live), or by the error in `--start-utc` (replay). The tracker estimates that offset per match, from the kill−death time most deaths agree on, before pairing. The `zkill` command prints it, and `--offset` overrides it. A death seen after the HUD was off screen (`gap_before_s`) may match a kill up to that much earlier. A killmail links to one ship only. An `unknown_time` death links only when exactly one candidate falls inside its match.
+
+Linked ships get `killmail_id`, `killmail_hash`, `killmail_utc`, `killmail_delta_s` (error after the offset) and `zkill_victim`. The kill is at `https://zkillboard.com/kill/<killmail_id>/`. Each run logs a `zkill` event per match. None of this is sent with `--post`.
+
 ## How it works
 
 | What | How |

@@ -78,7 +78,33 @@ CREATE TABLE IF NOT EXISTS ships (
     died_stream_offset_s REAL,
     death_confidence TEXT,      -- high (team score agrees) | low | unknown_time
     gap_before_s REAL,          -- HUD was off screen this long before the death was seen
+    killmail_id INTEGER,        -- zKillboard killmail for this death (stream-tracker zkill / --zkill)
+    killmail_hash TEXT,
+    killmail_utc TEXT,          -- killmail_time from the killmail
+    killmail_delta_s REAL,      -- killmail_utc - (died_utc + stream offset); NULL for unknown_time deaths
+    zkill_victim TEXT,          -- victim name on the killmail
     UNIQUE (match_id, side, slot)
+);
+
+CREATE TABLE IF NOT EXISTS killmails (
+    killmail_id INTEGER PRIMARY KEY,
+    hash TEXT,
+    killmail_utc TEXT NOT NULL,
+    region_id INTEGER,
+    solar_system_id INTEGER,
+    character_id INTEGER,
+    victim_name TEXT,
+    ship_type_id INTEGER,
+    ship_type TEXT,
+    fetched_utc TEXT
+);
+CREATE INDEX IF NOT EXISTS killmails_time ON killmails (killmail_utc);
+
+CREATE TABLE IF NOT EXISTS zkill_fetches (  -- region pages fetched back to start_utc, at fetched_utc
+    id INTEGER PRIMARY KEY,
+    region_id INTEGER NOT NULL,
+    start_utc TEXT NOT NULL,
+    fetched_utc TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -96,7 +122,9 @@ MIGRATIONS = {
     "matches": [("series_id", "INTEGER REFERENCES series(id)"), ("series_game", "INTEGER"),
                 ("tidi_overtime_s", "INTEGER"), ("phase", "TEXT"), ("match_no", "INTEGER"),
                 ("vod_url", "TEXT")],
-    "ships": [("died_clock_s", "INTEGER"), ("died_in_tidi", "INTEGER")],
+    "ships": [("died_clock_s", "INTEGER"), ("died_in_tidi", "INTEGER"), ("killmail_id", "INTEGER"),
+              ("killmail_hash", "TEXT"), ("killmail_utc", "TEXT"), ("killmail_delta_s", "REAL"),
+              ("zkill_victim", "TEXT")],
     "bans": [("pick", "INTEGER")],
 }
 
@@ -212,6 +240,45 @@ class Database:
             "INSERT INTO events (match_id, ts_utc, stream_offset_s, kind, payload_json) VALUES (?, ?, ?, ?, ?)",
             (match_id, ts_utc, offset, kind, json.dumps(payload) if payload else None),
         )
+
+    # ------------------------------------------------------------------- zkill
+
+    def deaths(self, match_ids: list[int] | None = None) -> list[sqlite3.Row]:
+        """Dead ships of non-abandoned matches, with their match's start and end."""
+        sql = ("SELECT s.*, m.live_start_utc, m.ended_utc, m.tidi_overtime_s FROM ships s"
+               " JOIN matches m ON m.id = s.match_id"
+               " WHERE s.death_confidence IS NOT NULL AND m.status != 'abandoned'")
+        params: tuple = ()
+        if match_ids is not None:
+            sql += f" AND s.match_id IN ({','.join('?' * len(match_ids))})"
+            params = tuple(match_ids)
+        return self.conn.execute(sql + " ORDER BY s.died_utc", params).fetchall()
+
+    def store_killmails(self, kills: list[dict], region_id: int, start_utc: str, fetched_utc: str) -> None:
+        """Cache fetched killmails, and note that the region was fetched from start_utc up to fetched_utc."""
+        self.conn.executemany(
+            "INSERT OR REPLACE INTO killmails (killmail_id, hash, killmail_utc, region_id, solar_system_id,"
+            " character_id, victim_name, ship_type_id, ship_type, fetched_utc)"
+            " VALUES (:killmail_id, :hash, :killmail_utc, :region_id, :solar_system_id, :character_id,"
+            " :victim_name, :ship_type_id, :ship_type, :fetched_utc)",
+            [{**k, "region_id": region_id, "fetched_utc": fetched_utc} for k in kills])
+        self.conn.execute("INSERT INTO zkill_fetches (region_id, start_utc, fetched_utc) VALUES (?, ?, ?)",
+                          (region_id, start_utc, fetched_utc))
+        self.conn.commit()
+
+    def zkill_fetched(self, region_id: int, start_utc: str, settled_utc: str) -> bool:
+        """Was the region fetched back to start_utc at or after settled_utc?"""
+        return self.conn.execute(
+            "SELECT 1 FROM zkill_fetches WHERE region_id = ? AND start_utc <= ? AND fetched_utc >= ? LIMIT 1",
+            (region_id, start_utc, settled_utc)).fetchone() is not None
+
+    def known_killmail_ids(self) -> set[int]:
+        return {r[0] for r in self.conn.execute("SELECT killmail_id FROM killmails WHERE victim_name IS NOT NULL")}
+
+    def killmails_between(self, start_utc: str, end_utc: str, region_id: int) -> list[dict]:
+        return [dict(r) for r in self.conn.execute(
+            "SELECT * FROM killmails WHERE killmail_utc >= ? AND killmail_utc <= ? AND region_id = ?"
+            " ORDER BY killmail_utc", (start_utc, end_utc, region_id))]
 
     # ------------------------------------------------------------------ series
 

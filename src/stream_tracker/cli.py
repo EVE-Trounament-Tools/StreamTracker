@@ -17,6 +17,7 @@ from .db import Database
 from .importer import ImportClient
 from .tracker import Tracker
 from .vocab import KNOWN_TEAMS_FILE, update_ship_csv
+from .zkill import REGION_ID, TOLERANCE_S, ZkillLinker, link_deaths
 
 PHASES = ("Qualifiers", "Main Event", "Semi-Finals", "Finals")  # the observed-import phase names
 
@@ -57,10 +58,17 @@ def vod_for(args) -> str | None:
     return f"https://www.twitch.tv/videos/{vid}" if vid else None
 
 
-def make_tracker(args, source: str | None) -> tuple[Tracker, ImportClient | None]:
-    """The tracker, plus an observed-import client when --post is given.
-    Posting is in addition to the local database, never instead of it."""
-    client = run_id = None
+def make_tracker(args, source: str | None) -> tuple[Tracker, ImportClient | None, ZkillLinker | None]:
+    """The tracker, plus an observed-import client when --post is given and a
+    zkill linker with --zkill. Posting is in addition to the local database,
+    never instead of it."""
+    client = run_id = linker = None
+    if args.zkill:
+        # Live (or a real-time replay of one), zKill may not have the kills
+        # yet when a match ends, so it is checked again later.
+        live = args.cmd == "live" or getattr(args, "realtime", False)
+        linker = ZkillLinker(args.db, delays_s=(180, 600, 1800) if live else (0,),
+                             tolerance_s=args.zkill_tolerance)
     if args.post:
         run_id = run_id_for(args)
         if not run_id:
@@ -70,12 +78,13 @@ def make_tracker(args, source: str | None) -> tuple[Tracker, ImportClient | None
     tracker = Tracker(Database(args.db), channel=args.channel, source=source, grace_s=args.grace,
                       debug_dir=args.debug_dir, run_id=run_id, phase=args.phase,
                       first_match=args.first_match, vod=vod_for(args), known_teams=args.teams,
-                      on_match_end=client.submit if client else None)
-    return tracker, client
+                      on_match_end=client.submit if client else None,
+                      on_match_closed=linker.submit if linker else None)
+    return tracker, client, linker
 
 
 def run(source, tracker: Tracker, report_every: int = 600, recorder: HudRecorder | None = None,
-        client: ImportClient | None = None) -> None:
+        client: ImportClient | None = None, linker: ZkillLinker | None = None) -> None:
     times = []
     t = None
     try:
@@ -95,6 +104,8 @@ def run(source, tracker: Tracker, report_every: int = 600, recorder: HudRecorder
         tracker.close(t)
         if client is not None:
             client.close()  # wait for pending posts
+        if linker is not None:
+            linker.close()
         if recorder is not None:
             recorder.close()
         if times:
@@ -104,8 +115,8 @@ def run(source, tracker: Tracker, report_every: int = 600, recorder: HudRecorder
 
 
 def cmd_live(args) -> None:
-    tracker, client = make_tracker(args, "live")
-    run(LiveSource(args.channel, quality=args.quality), tracker, client=client)
+    tracker, client, linker = make_tracker(args, "live")
+    run(LiveSource(args.channel, quality=args.quality), tracker, client=client, linker=linker)
 
 
 def cmd_replay(args) -> None:
@@ -124,9 +135,9 @@ def cmd_replay(args) -> None:
             realtime=args.realtime,
             start_utc=start_utc,
         )
-    tracker, client = make_tracker(args, args.input)
+    tracker, client, linker = make_tracker(args, args.input)
     recorder = HudRecorder(args.save_hud) if args.save_hud else None
-    run(source, tracker, recorder=recorder, client=client)
+    run(source, tracker, recorder=recorder, client=client, linker=linker)
 
 
 def cmd_calibrate(args) -> None:
@@ -170,6 +181,17 @@ def cmd_series(args) -> None:
         db.close()
 
 
+def cmd_zkill(args) -> None:
+    """Link the deaths in existing databases to their zKillboard killmails."""
+    for path in args.db:
+        db = Database(path)
+        s = link_deaths(db, tolerance_s=args.tolerance, offset_s=args.offset, region=args.region)
+        offsets = sorted(set(round(o) for o in s["offsets"].values()))
+        print(f"{path}: {s['linked']} of {s['deaths']} deaths linked to killmails"
+              f" (stream offset {', '.join(f'{o:+d}s' for o in offsets) or 'n/a'})")
+        db.close()
+
+
 def cmd_update_ships(args) -> None:
     print(f"wrote {update_ship_csv()} ships")
 
@@ -197,6 +219,11 @@ def main(argv=None) -> None:
         p.add_argument("--teams", type=Path, default=KNOWN_TEAMS_FILE, metavar="FILE",
                        help="known teams (one per line, or a tournament JSON) that team names are best-fit"
                             " to outside the Qualifiers (default: data/known_teams.txt)")
+        p.add_argument("--zkill", action="store_true",
+                       help="link each finished match's deaths to their zKillboard killmails (in --db)")
+        p.add_argument("--zkill-tolerance", type=float, default=TOLERANCE_S, metavar="S",
+                       help="furthest a killmail may be from a death, after the stream offset"
+                            f" (default {TOLERANCE_S}s)")
 
     p = sub.add_parser("live", help="track a live Twitch channel")
     p.add_argument("channel", help="channel name or stream URL")
@@ -227,6 +254,15 @@ def main(argv=None) -> None:
     p = sub.add_parser("series", help="group the matches in existing databases into series")
     p.add_argument("db", nargs="+")
     p.set_defaults(func=cmd_series)
+
+    p = sub.add_parser("zkill", help="link the deaths in existing databases to zKillboard killmails")
+    p.add_argument("db", nargs="+")
+    p.add_argument("--tolerance", type=float, default=TOLERANCE_S, metavar="S",
+                   help=f"furthest a killmail may be from a death, after the stream offset (default {TOLERANCE_S}s)")
+    p.add_argument("--offset", type=float, metavar="S",
+                   help="killmail time minus died_utc, if known (default: estimated from the deaths)")
+    p.add_argument("--region", type=int, default=REGION_ID, help=f"zKillboard region (default {REGION_ID})")
+    p.set_defaults(func=cmd_zkill)
 
     p = sub.add_parser("update-ships", help="refresh data/ship_points.csv from the AT points sheet")
     p.set_defaults(func=cmd_update_ships)

@@ -202,6 +202,7 @@ class Tracker:
         vod: str | None = None,
         known_teams: Path = KNOWN_TEAMS_FILE,
         on_match_end: Callable[[dict], None] | None = None,
+        on_match_closed: Callable[[int], None] | None = None,
     ):
         self.db = db
         self.channel = channel
@@ -211,6 +212,7 @@ class Tracker:
         self.first_match = first_match  # lowest number for this phase's next match (continues a phase across DBs)
         self.vod = vod  # Twitch VOD URL the offsets are into; None when live
         self.on_match_end = on_match_end  # called with each finished match's import object
+        self.on_match_closed = on_match_closed  # called with each finished match's id (zkill linking)
         self.vocab = vocab or default_vocab()
         self.teams = TeamNames.from_file()
         # Past the Qualifiers every team is known, so names are best-fit to the tournament's spelling.
@@ -481,6 +483,11 @@ class Tracker:
                 self.on_match_end(self.export(m))
             except Exception:
                 log.exception("match %d: sending to observed import failed", m.id)
+        if self.on_match_closed is not None:
+            try:
+                self.on_match_closed(m.id)
+            except Exception:
+                log.exception("match %d: zkill linking failed", m.id)
 
     # ------------------------------------------------------------------- phase
 
