@@ -30,7 +30,7 @@ from . import draft, layout as L, reader
 from .db import Database
 from .hud import Phase
 from .reader import SIDES, FrameReading, Identity
-from .vocab import KNOWN_TEAMS_FILE, TEAM_SNAP_SCORE, KnownTeams, ShipVocab, TeamNames, default_vocab
+from .vocab import KNOWN_TEAMS_FILE, TEAM_SNAP_SCORE, KnownTeams, ShipVocab, TeamNames, default_vocab, looks_like_name
 
 log = logging.getLogger(__name__)
 
@@ -359,6 +359,14 @@ class Tracker:
                     and m.last_clock_t is not None and m.tidi_start is None):
                 expected = m.last_clock - (t.offset - m.last_clock_t.offset)
                 if abs(r.clock - max(expected, 0)) > CLOCK_TOLERANCE_S:
+                    # With the same rosters, a clock that hasn't gone back up is
+                    # this match after a freeze or pause (clock behind: AT XXII
+                    # finals, the picture froze at 6:57 for ~30s) or a skip in
+                    # the stream (clock ahead: the VOD drops a few seconds), not
+                    # a clip of an earlier moment. Re-anchor on it.
+                    if r.clock <= m.last_clock + 1 and self._same_roster(m, r):
+                        m.last_clock, m.last_clock_t = r.clock, t
+                        return True
                     return False
         return True
 
@@ -418,6 +426,7 @@ class Tracker:
         m.end_reason = None
         m.time_up = None
         m.zero_frames = 0
+        m.foreign_streak = 0
         if m.identity_reads < IDENTITY_MAX_READS:
             m.identity_settled = False  # keep voting; names settled early on few reads
         self._update(m, status="live", ended_utc=None, end_reason=None)
@@ -730,9 +739,13 @@ class Tracker:
 
     def _vote_bans(self, m: MatchState, side: str, bans: list[str], vote) -> None:
         """Vote the ban list top-down as one tuple, so the stored ordinals
-        follow the order shown on stream. No bans at all is a valid list."""
-        raws = tuple(bans)
-        hits = [self.vocab.match(raw).ship for raw in raws]
+        follow the order shown on stream. No bans at all is a valid list.
+        Unmatched reads that aren't name-like are dropped: the ban count can
+        overshoot, and the extra rows are OCR of the game scene behind them."""
+        hits = [self.vocab.match(raw).ship for raw in bans]
+        kept = [(raw, hit) for raw, hit in zip(bans, hits) if hit or looks_like_name(raw)]
+        raws = tuple(raw for raw, _ in kept)
+        hits = [hit for _, hit in kept]
         if any(hits) or not raws:
             names = tuple(h.name if h else UNMATCHED + raw for h, raw in zip(hits, raws))
             vote(("bans", side), names)
@@ -807,6 +820,7 @@ class Tracker:
         log.info("match %d identity: %s vs %s", m.id, teams["red"], teams["blue"])
         ts, offset = self._now()
         self._log(m, ts, offset, "identity_settled", {"reads": m.identity_reads})
+        self._teams_from_pilots(m, fitted)
         # Repeat pairings are games of one series (Bo3/Bo5), even with other
         # matches played in between.
         m.series_id, mismatch = self.db.assign_series(m.id)
@@ -818,6 +832,37 @@ class Tracker:
             series = self.db.series_summary(m.id)
             log.info("match %d: series %d game %d", m.id, m.series_id, series["game"])
             self._log(m, ts, offset, "series", series)
+
+    def _teams_from_pilots(self, m: MatchState, fitted: dict[str, str | None]) -> None:
+        """Correct a side's team name from its pilots, outside the Qualifiers.
+
+        AT XXII finals day 1: the overlay put PSYCHOKIDS. over Rote Kapelle's
+        roster and vice versa (match 24), and read the IIII… team as
+        "SUMUUOUIOUNNNNNNOTIME" (match 19). Both teams had played earlier in
+        the day with the same pilots. Only a swap of the two names, or a name
+        that fits no known team, is corrected; a known name is otherwise kept,
+        as a roster can be shared between a team and its alt.
+        """
+        if self.known_teams is None:
+            return
+        roster = {side: self.db.team_for_pilots(self.db.pilots(m.id, side), m.id) for side in SIDES}
+        new = dict(fitted)
+        if roster["red"] and roster["red"] == fitted["blue"] and roster["blue"] in (fitted["red"], None):
+            new = {"red": fitted["blue"], "blue": fitted["red"]}  # labels swapped
+        elif roster["blue"] and roster["blue"] == fitted["red"] and roster["red"] is None:
+            new = {"red": fitted["blue"], "blue": fitted["red"]}
+        else:
+            for side in SIDES:
+                team = roster[side]
+                if (team and team != fitted[side] and fitted[side] not in self.known_teams.names
+                        and team != new[OTHER[side]]):
+                    new[side] = team
+        if new == fitted:
+            return
+        log.warning("match %d: teams from pilots: %s vs %s (overlay: %s vs %s)",
+                    m.id, new["red"], new["blue"], fitted["red"], fitted["blue"])
+        self._log(m, *self._now(), "team_from_pilots", {"overlay": fitted, "pilots": new})
+        self._update(m, red_team=new["red"], blue_team=new["blue"])
 
     # ------------------------------------------------------------------- draft
 
@@ -897,7 +942,7 @@ class Tracker:
             return None
         sides = {}
         for dside, name in d.teams.items():
-            hits = [side for side in SIDES if same_team(name, teams[side])]
+            hits = [side for side in SIDES if self._same_known_team(name, teams[side])]
             if len(hits) == 1:
                 sides[dside] = hits[0]
         if len(set(sides.values())) < len(sides):
@@ -936,16 +981,28 @@ class Tracker:
             drafted = drafted[:i] + [h] + drafted[i + 1:]
         return drafted
 
+    def _same_known_team(self, a: str | None, b: str | None) -> bool:
+        """same_team, or (outside the Qualifiers) both names best-fit to the
+        same known team: the draft panel's misreads ("Rote Kapalla",
+        "xgtywiznalamyu") differ from the HUD's too much for same_team."""
+        if same_team(a, b):
+            return True
+        if self.known_teams is None or not (a and b):
+            return False
+        fa, fb = self.known_teams.fit(a), self.known_teams.fit(b)
+        return fa == fb and fa in self.known_teams.names
+
     @staticmethod
     def _draft_agrees(d: Draft, sides: dict[str, str], hud: dict[str, list]) -> bool:
         """Do the draft's bans name the same ships as the HUD's lists? One
-        ship read wrong on either is allowed."""
+        ship read wrong on either is allowed. HUD reads that matched no ship
+        don't count against it: they are as likely noise as a ship."""
         if len(d.bans) < DRAFT_MIN_BANS_TO_AGREE:
             return False
         off = 0
         for dside, side in sides.items():
             want = Counter(typ or raw for s, raw, typ in d.bans if s == dside)
-            got = Counter(typ or raw for raw, typ in hud.get(side, []))
+            got = Counter(typ for raw, typ in hud.get(side, []) if typ)
             off += sum(((want - got) + (got - want)).values())
         return off <= 2
 

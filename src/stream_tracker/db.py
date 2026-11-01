@@ -224,6 +224,24 @@ class Database:
             "SELECT pilot FROM ships WHERE match_id = ? AND side = ? AND pilot IS NOT NULL",
             (match_id, side))]
 
+    def pilots(self, match_id: int, side: str) -> list[str]:
+        return self._pilots(match_id, side)
+
+    def team_for_pilots(self, pilots: list[str], before_id: int, lookback: int = 60) -> str | None:
+        """The team that fielded these pilots in the latest earlier match
+        (SERIES_MIN_SHARED_PILOTS or more in common), or None."""
+        if len(pilots) < SERIES_MIN_SHARED_PILOTS:
+            return None
+        for row in self.conn.execute(
+            "SELECT id, red_team, blue_team FROM matches WHERE id < ? AND status != 'abandoned' "
+            "ORDER BY id DESC LIMIT ?", (before_id, lookback),
+        ):
+            for side in ("red", "blue"):
+                team = row[f"{side}_team"]
+                if team and shared_pilots(pilots, self._pilots(row["id"], side)) >= SERIES_MIN_SHARED_PILOTS:
+                    return team
+        return None
+
     def _same_lineups(self, m: sqlite3.Row, other: sqlite3.Row) -> bool:
         """Does each team field enough of the same pilots in both matches?
         A side whose pilots weren't read doesn't count against it."""

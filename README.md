@@ -98,6 +98,11 @@ Death times:
 - **Faded or dimmed overlay:** alive/dead is judged relative to the column headings' brightness.
 - **Stale overlay showing both teams wiped:** ignored.
 - **Team names changed mid-match:** the match is recognised by its rosters' points.
+- **Frozen or stalled picture:** a clock that stops, or falls behind wall time after the feed stalls, is re-anchored as long as the rosters match. It doesn't end the match. A clock that jumps back up is still taken for a clip. (AT XXII Finals day 1: the picture froze for ~30s, and the match was ended and reopened every 30s.)
+- **Noise in the ban list:** the HUD can show more ban rows than there are bans. A read that matches no ship is kept only if it looks like a name (1–3 words of letters, one of them 4+ letters long). Specks ("_ Dapier") and 7-for-Z ("7arma7d") are cleaned before matching.
+- **Wrong team on the overlay** (outside the Qualifiers): when a side's pilots fielded for another team earlier in `--db`, that team is used in two cases: the overlay swapped the two names, or its name fits no known team (the IIII team read as "SUMUUOUIOUNNNNNNOTIME"). Logged as `team_from_pilots`.
+- **Draft panel misreads:** the panel's team names are compared after both are fitted to the known teams ("Rote Kapalla"). HUD bans that match no ship don't count against a draft.
+- **Ban counts in the Finals:** drafts had 8–12 bans (up to 6 a side). The tracker sends whatever the panel shows.
 - **Pilot names spilling into the PTS column.**
 - **In-game labels showing just above the timer.**
 

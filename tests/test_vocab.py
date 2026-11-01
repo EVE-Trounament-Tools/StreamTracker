@@ -106,3 +106,31 @@ def test_known_teams_from_tournament_json(tmp_path):
     path = tmp_path / "t.json"
     path.write_text('{"teams": [{"name": "WE FORM V0LTA"}, {"name": "Seker Matar"}]}')
     assert KnownTeams.from_file(path).fit("SEKER MATAR") == "Seker Matar"
+
+
+@pytest.mark.parametrize("raw, expected", [
+    # AT XXII finals day 1: ban rows read over the game scene
+    ("_ Dapier", "Rapier"),
+    ("’ Thalia", "Thalia"),
+    ("7arma7d", "Zarmazd"),
+    (". Sontinel", "Sentinel"),
+])
+def test_specks_and_sevens_in_ban_reads(vocab, raw, expected):
+    assert vocab.match(raw).ship.name == expected
+
+
+@pytest.mark.parametrize("raw", [
+    "—_ ew ~—Sti«é(S", "| > a)", "| yw” yg.", "Sea O:\\N", "| ee AS", "| YY MT AS pier",
+    "Dy N Te", "UMN", "Co . lian", "| a re. 4 iros", "me aeee—t—=éiliia’”",
+])
+def test_scene_noise_is_not_a_name(raw):
+    from stream_tracker.vocab import looks_like_name
+
+    assert not looks_like_name(raw)
+
+
+@pytest.mark.parametrize("raw", ["Cenotaph", "a Kitcyne", "Noacon", "Magnate Navy Issue"])
+def test_misread_names_still_look_like_names(raw):
+    from stream_tracker.vocab import looks_like_name
+
+    assert looks_like_name(raw)

@@ -128,6 +128,89 @@ def test_foreign_hud_mid_match_is_ignored(frame, tmp_path, running_clock):
     assert m["end_reason"] == "time" and m["red_team"] == "NEON NIGHTMARES"
 
 
+def _clock_by_offset(monkeypatch, clock_at):
+    """Like running_clock, but the clock is clock_at(offset)."""
+    from stream_tracker.hud import Phase
+
+    read_frame = reader.read_frame
+    state = {}
+
+    def fake(frame):
+        r = read_frame(frame)
+        if r.phase == Phase.LIVE and r.clock not in (None, 0):
+            r.clock = clock_at(state["offset"])
+        return r
+
+    monkeypatch.setattr(reader, "read_frame", fake)
+    orig = Tracker.process
+
+    def process(self, f, t):
+        state["offset"] = t.offset
+        return orig(self, f, t)
+
+    monkeypatch.setattr(Tracker, "process", process)
+
+
+def test_frozen_clock_doesnt_end_the_match(monkeypatch, frame, tmp_path):
+    """AT XXII finals day 1, match 1: the broadcast froze at 6:57 and no frames
+    arrived for ~30s; when they came back the clock carried on from 6:57, ~30s
+    behind wall time. The match must stay open: no hud_lost end/reopen loop."""
+    n = MIN_LATE_JOIN_HUD_FRAMES + 10  # joined late, so a shorter match would be dropped as a clip ad
+    stall = (640 + n, 640 + n + 30)
+
+    def clock_at(offset):
+        if offset < stall[0]:
+            return 584 - int(offset - 662)
+        return 584 - (stall[0] - 662) - int(offset - stall[1])  # carries on from the frozen value
+
+    _clock_by_offset(monkeypatch, clock_at)
+    db_path = tmp_path / "t.sqlite"
+    tracker = Tracker(Database(db_path))
+    seq = live_frames(frame, 640, n) + live_frames(frame, stall[1], 60)  # no frames during the stall
+    feed(tracker, seq)
+    kinds = [e["kind"] for e in rows(db_path, "SELECT kind FROM events")]
+    assert "match_ended" not in kinds and "match_reopened" not in kinds
+    assert tracker.match.foreign_streak == 0
+
+
+def test_skipped_seconds_dont_end_the_match(monkeypatch, frame, tmp_path):
+    """AT XXII finals VOD, match 1 at 1390s: the clock went 554 -> 547 in 4s
+    (the stream dropped a few seconds), then kept running from there."""
+    n = MIN_LATE_JOIN_HUD_FRAMES + 10
+    skip_at = 640 + n
+
+    def clock_at(offset):
+        return 584 - int(offset - 662) - (7 if offset >= skip_at else 0)
+
+    _clock_by_offset(monkeypatch, clock_at)
+    db_path = tmp_path / "t.sqlite"
+    tracker = Tracker(Database(db_path))
+    feed(tracker, live_frames(frame, 640, n + 60))
+    kinds = [e["kind"] for e in rows(db_path, "SELECT kind FROM events")]
+    assert "match_ended" not in kinds and "match_reopened" not in kinds
+
+
+def test_rewound_clock_is_still_foreign(monkeypatch, frame, tmp_path):
+    """A clip of an earlier moment of the match (clock jumps back up) is not a freeze."""
+    def clock_at(offset):
+        if 670 <= offset < 680:
+            return 590  # well above the last reading
+        return 584 - int(offset - 662)
+
+    _clock_by_offset(monkeypatch, clock_at)
+    tracker = Tracker(Database(tmp_path / "t.sqlite"))
+    feed(tracker, live_frames(frame, 640, 35))
+    assert tracker.match.foreign_streak > 0
+
+
+def test_reopen_clears_the_foreign_streak(tmp_path):
+    _, tracker, m = _hand_match(tmp_path)
+    tracker.match = m
+    m.foreign_streak = 30
+    tracker._reopen(FrameTime(T0, 10))
+    assert m.foreign_streak == 0
+
+
 def test_hud_lost_ends_after_grace(frame, tmp_path, running_clock):
     db_path = tmp_path / "t.sqlite"
     tracker = Tracker(Database(db_path), grace_s=10)
@@ -178,6 +261,17 @@ def test_unknown_ban_keeps_the_others(tmp_path):
     bans = rows(db_path, "SELECT ship_raw, ship_type FROM bans WHERE side='red' ORDER BY ordinal")
     assert [(b["ship_raw"], b["ship_type"]) for b in bans] == [
         ("Zarmazd", "Zarmazd"), ("Raven Navy Issue", "Raven Navy Issue"), ("Cenotaph", None)]
+
+
+def test_scene_noise_rows_are_dropped_from_bans(tmp_path):
+    """AT XXII finals match 14: the ban count overshot and the extra rows were
+    OCR of the game scene. Every read had them, so voting can't remove them."""
+    db_path, tracker, m = _hand_match(tmp_path)
+    noisy = ("Ashimmu", "Anhinga", "Zarmazd,", "Huginn", "_ Dapier", "—_ ew ~—Sti«é(S", "| > a)", "Sea O:\\N")
+    for _ in range(3):
+        tracker._vote(m, _identity(blue_bans=noisy))
+    bans = rows(db_path, "SELECT ship_type FROM bans WHERE side='blue' ORDER BY ordinal")
+    assert [b["ship_type"] for b in bans] == ["Ashimmu", "Anhinga", "Zarmazd", "Huginn", "Rapier"]
 
 
 def _identity(red="THE TUSKERS CO.", blue="META RELOADED", red_bans=("Zarmazd", "Eos"), blue_bans=(),
@@ -415,6 +509,39 @@ def test_draft_not_taken_on_one_name_alone(monkeypatch, tmp_path):
     assert rows(db_path, "SELECT count(*) n FROM bans WHERE pick IS NOT NULL") == [{"n": 0}]
 
 
+def _finals_match(tmp_path):
+    db_path = tmp_path / "t.sqlite"
+    db = Database(db_path)
+    tracker = Tracker(db, phase="Finals")
+    m = MatchState(id=db.create_match(None, None, T0.isoformat(), "Finals"), team_crops=np.zeros((1, 1), np.float32))
+    return db_path, tracker, m
+
+
+def test_draft_names_matched_through_known_teams(monkeypatch, tmp_path):
+    """AT XXII finals match 14: the panel read "Rote Kapalla", the HUD "ROTE KAPELLE"."""
+    db_path, tracker, m = _finals_match(tmp_path)
+    _fake_draft(monkeypatch, red="Rote Kapalla", blue="RUSTY HYENAS CLAN",
+                bans=[("red", "Deacon"), ("blue", "Huginn"), ("blue", "Rapier"), ("red", "Maulus")])
+    _see_draft(tracker)
+    for _ in range(3):
+        tracker._vote(m, _identity(red="ROTE KAPELLE", blue="RUSTY HYENAS CLAN", red_bans=("Deacon", "Maulus"),
+                                   blue_bans=("Huginn", "Rapier")))
+    assert rows(db_path, "SELECT count(*) n FROM bans WHERE pick IS NOT NULL") == [{"n": 4}]
+
+
+def test_draft_taken_despite_noise_in_the_hud_bans(monkeypatch, tmp_path):
+    """One name matches; the HUD lists carry scene-noise rows and a misread ship."""
+    db_path, tracker, m = _hand_match(tmp_path)
+    _fake_draft(monkeypatch, red="Neon Nightmares", blue="Rote Kapelle",
+                bans=[("red", "Zarmazd"), ("blue", "Maulus"), ("blue", "Vigil"), ("red", "Eos")])
+    _see_draft(tracker)
+    for _ in range(3):
+        tracker._vote(m, _identity(red="NEON NIGHTMARES", blue="UNC KAPELLE", red_bans=("Eos", "Zarmazd", "Noacon", "Irse"),
+                                   blue_bans=("Vigil", "Maulus", "Kitcyne")))
+    bans = rows(db_path, "SELECT ship_type, pick FROM bans ORDER BY pick")
+    assert [b["ship_type"] for b in bans] == ["Zarmazd", "Maulus", "Vigil", "Eos"]
+
+
 def test_clearer_read_wins_a_one_ship_disagreement(monkeypatch, tmp_path):
     """The panel read "Rapler" (-> Reaper) and the HUD "?agu": each side
     keeps the read that matches the ship list best, in pick order."""
@@ -444,3 +571,48 @@ def test_team_names_best_fit_only_past_the_qualifiers(tmp_path, phase, stored):
     row = rows(db_path, "SELECT red_team, blue_team FROM matches")[0]
     assert row["red_team"] == stored
     assert row["blue_team"] == ("SEKER MATAR" if phase in (None, "Qualifiers") else "Seker Matar")
+
+
+PK = ["Jim Raynor", "Avery77", "Catastrophic", "Aleks Ohmiras", "Pashko Morgan"]
+RK = ["Kibitt Kallinikov", "Auroraqual", "Devin Penken", "Rima Ambraelle", "Rotan Oskold"]
+
+
+def _with_rosters(db, red, blue, red_pilots, blue_pilots):
+    mid = db.create_match(None, None, T0.isoformat(), "Finals")
+    db.update_match(mid, red_team=red, blue_team=blue, status="complete")
+    for side, pilots in (("red", red_pilots), ("blue", blue_pilots)):
+        for i, p in enumerate(pilots):
+            db.upsert_ship(mid, side, i, pilot=p)
+    return mid
+
+
+def _settle_rosters(tmp_path, red, blue, red_pilots, blue_pilots):
+    db_path = tmp_path / "t.sqlite"
+    db = Database(db_path)
+    _with_rosters(db, "Psychokids.", "Rote Kapelle", PK, RK)
+    tracker = Tracker(db, phase="Finals")
+    mid = _with_rosters(db, red, blue, red_pilots, blue_pilots)
+    m = MatchState(id=mid, team_crops=np.zeros((1, 1), np.float32))
+    tracker._teams_from_pilots(m, {"red": red, "blue": blue})
+    (row,) = rows(db_path, f"SELECT red_team, blue_team FROM matches WHERE id = {mid}")
+    return row["red_team"], row["blue_team"]
+
+
+def test_swapped_overlay_names_are_fixed_from_pilots(tmp_path):
+    """AT XXII finals match 24: PSYCHOKIDS. was shown over Rote Kapelle's roster."""
+    pk_misread = ["J1m Raynor", "Avery77", "Catastrophic", "Jinx Alvarez", "RuGret"]
+    assert _settle_rosters(tmp_path, "Psychokids.", "Rote Kapelle", RK, pk_misread) == ("Rote Kapelle", "Psychokids.")
+
+
+def test_unreadable_team_name_taken_from_pilots(tmp_path):
+    """AT XXII finals match 19: the IIII… team read as SUMUUOUIOUNNNNNNOTIME."""
+    assert _settle_rosters(tmp_path, "Rote Kapelle", "SUMUUOUIOUNNNNNNOTIME", RK, PK) == ("Rote Kapelle", "Psychokids.")
+
+
+def test_known_names_kept_when_pilots_agree(tmp_path):
+    assert _settle_rosters(tmp_path, "Psychokids.", "Rote Kapelle", PK, RK) == ("Psychokids.", "Rote Kapelle")
+
+
+def test_known_name_not_overridden_by_one_shared_roster(tmp_path):
+    """A known team on the overlay stays, even if its pilots match another team (alts, mercs)."""
+    assert _settle_rosters(tmp_path, "Dracarys.", "Sedition.", PK, ["a", "b", "c"]) == ("Dracarys.", "Sedition.")

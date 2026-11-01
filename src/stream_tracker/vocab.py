@@ -75,9 +75,26 @@ def aliases(name: str) -> set[str]:
 
 def clean(raw: str) -> str:
     text = raw.replace("…", "").replace("...", "").strip()
+    # Leading specks from the scene behind the ban list: "_ Dapier", "a Kitcyne", "’ Thalia".
+    text = re.sub(r"^(?:[^\w\s]+|_+|[a-z])\s+(?=\w)", "", text)
+    # A 7 in an otherwise all-letter word is a misread Z ("7arma7d").
+    text = re.sub(r"\b(?=[A-Za-z7]*[A-Za-z]{3})[A-Za-z7]*7[A-Za-z7]*\b",
+                  lambda m: m.group().replace("7", "z").capitalize() if m.group()[0] == "7"
+                  else m.group().replace("7", "z"), text)
     # "N.Magnate" / "N Magnate" -> "N. Magnate"
     text = re.sub(r"^([A-Z](?:\.[A-Z])?)\.?\s*(?=[A-Z][a-z])", r"\1. ", text)
     return re.sub(r"\s+", " ", text)
+
+
+def looks_like_name(raw: str) -> bool:
+    """Could this unmatched read be a real name (a ship not in the list, like
+    Cenotaph), not OCR of the game scene behind an empty HUD row
+    ("| yw” yg.", "Sea O:\\N")? Ship names are 1-3 words of letters, one of
+    them 4+ letters long."""
+    words = clean(raw).split()
+    return (0 < len(words) <= 3
+            and all(re.fullmatch(r"[A-Za-z][A-Za-z'.,-]*", w) for w in words)
+            and any(re.search(r"[A-Za-z]{4}", w) for w in words))
 
 
 def _score(text: str, form: str, **kwargs) -> float:
@@ -201,6 +218,9 @@ class KnownTeams:
         best = fuzz.ratio(squashed, k_squashed)
         if len(squashed) >= PREFIX_MIN and k_squashed.startswith(squashed):
             best = max(best, 95)
+        elif len(squashed) >= 8 and len(k_squashed) > len(squashed):
+            # a cut-off name with a misread letter ("XGTYWIZNALAMYU")
+            best = max(best, fuzz.ratio(squashed, k_squashed[: len(squashed)]) - 5)
         # every word of the name in the team's ("THE BLUE." in "OUT OF THE BLUE.")
         return max(best, 0.95 * fuzz.token_set_ratio(words, k_words))
 
