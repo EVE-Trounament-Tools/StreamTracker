@@ -65,6 +65,15 @@ def test_wrong_ship_or_pilot_not_linked():
     assert pair_deaths(d, [kill(1, "Someone Else", "Raven", 1)], offset_s=0)[0] == {}
 
 
+def test_unreadable_pilot_links_on_ship_and_time():
+    # The "IIIIIIIIII ll" pilot reads as "TTT": only the ship and time can say.
+    d = [death(0, "TTT", "Raven", 0)]
+    assert pair_deaths(d, [kill(1, "IIIIIIIIII ll", "Raven", 2)], offset_s=0)[0][(1, "red", 0)].kill.killmail_id == 1
+    # ... but not when two kills of that ship are as close, or the kill is too far.
+    assert pair_deaths(d, [kill(1, "A", "Raven", 2), kill(2, "B", "Raven", -2)], offset_s=0)[0] == {}
+    assert pair_deaths(d, [kill(1, "A", "Raven", 30)], offset_s=0)[0] == {}
+
+
 def test_kill_links_only_once():
     deaths = [death(0, "Foo Bar", "Raven", 0), death(1, "Foo Baz", "Raven", 5)]
     links, _, _ = pair_deaths(deaths, [kill(1, "Foo Bar", "Raven", 1)], offset_s=0)

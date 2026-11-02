@@ -46,6 +46,10 @@ OFFSET_WINDOW_S = 20  # deaths read off the stream agree with the killmails to w
 MIN_OFFSET_PAIRS = 3  # fewer pairs than this can't estimate an offset; 0 is used
 NAME_MIN = 60  # pilot-name similarity needed when the ship type also matches (OCR'd names are noisy)
 NAME_MIN_NO_SHIP = 85  # ... and when the ship type wasn't read
+# A death whose pilot name couldn't be read (the "IIIIIIIIII ll" pilot read as
+# "TTT") links to the one killmail for its ship type this close to it, if
+# there is exactly one.
+SHIP_ONLY_TOLERANCE_S = 5
 SETTLE_S = 3600  # zKill has every kill by this long after it happened
 RETRY_DELAYS_S = (180, 600, 1800)  # background re-checks after a live match ends
 
@@ -198,6 +202,14 @@ def name_score(hud: str | None, victim: str | None) -> float:
     return fuzz.ratio(a, b) if a and b else 0.0
 
 
+def unreadable(pilot: str | None) -> bool:
+    """A HUD pilot name too garbled to compare: under 4 letters, or only
+    the bar-like letters a run of I's and l's reads as ("TTT")."""
+    n, _ = _clean_name(pilot or "")
+    letters = re.sub(r"[^a-z0-9]", "", n)
+    return len(letters) < 4 or re.fullmatch(r"[til1j]+", letters) is not None
+
+
 def is_candidate(d: Death, k: Kill) -> bool:
     if d.ship_type:
         return (k.ship_type or "").casefold() == d.ship_type.casefold() and name_score(d.pilot, k.victim) >= NAME_MIN
@@ -236,8 +248,10 @@ def pair_deaths(deaths: list[Death], kills: list[Kill], tolerance_s: float = TOL
     A death takes the candidate kill nearest its offset-corrected time, within
     tolerance (more on the early side when the HUD was off screen before the
     death was seen). Closest pairs are settled first, so a pilot who died twice
-    gets each kill matched to the nearer death. An unknown_time death links
-    only when exactly one unused candidate falls inside its match.
+    gets each kill matched to the nearer death. A death whose pilot name is
+    unreadable and matches no killmail takes the only unused kill of its ship type
+    within SHIP_ONLY_TOLERANCE_S, if there is just one. An unknown_time death
+    links only when exactly one unused candidate falls inside its match.
     """
     cands = candidate_pairs(deaths, kills)
     support = 0
@@ -259,6 +273,17 @@ def pair_deaths(deaths: list[Death], kills: list[Kill], tolerance_s: float = TOL
             continue
         links[deaths[i].key] = Link(k, round(err, 1))
         used.add(kid)
+    for i, d in enumerate(deaths):
+        if d.died is None or d.key in links or cands[i] or not d.ship_type or not unreadable(d.pilot):
+            continue
+        near = [k for k in kills if k.killmail_id not in used
+                and (k.ship_type or "").casefold() == d.ship_type.casefold()
+                and -SHIP_ONLY_TOLERANCE_S - (d.gap_s or 0)
+                <= (k.time - d.died).total_seconds() - offset_s <= SHIP_ONLY_TOLERANCE_S]
+        if len(near) == 1:
+            k = near[0]
+            links[d.key] = Link(k, round((k.time - d.died).total_seconds() - offset_s, 1))
+            used.add(k.killmail_id)
     shift = timedelta(seconds=offset_s)
     for i, d in enumerate(deaths):
         if d.died is not None or d.window is None:

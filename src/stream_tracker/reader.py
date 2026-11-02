@@ -5,6 +5,7 @@ read_identity() uses tesseract for team, ban, ship and pilot names; it takes
 seconds, so the tracker only calls it until those fields are settled.
 """
 
+import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
@@ -128,6 +129,18 @@ def read_frame(frame: np.ndarray) -> FrameReading:
 
 _pool = ThreadPoolExecutor(max_workers=4)
 
+# Tesseract's reads of a run of thin vertical bars (I and l).
+BAR_LIKE = re.compile(r"[TIl1|!\[\]UJi]*")
+# The HUD's slashed zero reads as e, @, a, o or 8 after another digit:
+# "psilon2ee@" (psilon2000), "shyt38aa" (shyt3000). Only a run at the end of
+# a word that starts with a digit and holds one such letter is rewritten,
+# so a name like "pilot38" or "2each" is left alone.
+_ZERO_RUN = re.compile(r"(?<=\d)[0-9e@aoø8]*[e@aoø][0-9e@aoø8]*(?=$|[\s…])")
+
+
+def fix_slashed_zeros(name: str) -> str:
+    return _ZERO_RUN.sub(lambda m: re.sub(r"[e@aoø8]", "0", m.group()), name)
+
 
 def bars_only_name(region: np.ndarray) -> str:
     """Tesseract returns nothing for a name made only of 'I's (one team is
@@ -161,6 +174,12 @@ def read_identity(frame: np.ndarray, reading: FrameReading) -> Identity:
         if not text[("team", side, 0)]:
             team_box = L.RED_TEAM if side == "red" else L.BLUE_TEAM
             text[("team", side, 0)] = bars_only_name(L.crop(frame, team_box))
+    for key in [k for k in text if k[0] == "pilot"]:
+        # A pilot named all I's and l's reads as "TTT" or nothing (AT XXII
+        # finals, "IIIIIIIIII ll").
+        if BAR_LIKE.fullmatch(text[key]):
+            text[key] = bars_only_name(L.crop(frame, jobs[key])) or text[key]
+        text[key] = fix_slashed_zeros(text[key])
 
     def collect(kind, side):
         keys = sorted(k for k in text if k[0] == kind and k[1] == side)

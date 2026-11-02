@@ -61,7 +61,7 @@ Each match also gets a `vod_url`, stored in `--db` and sent with the match: the 
 
 `--phase` (`Qualifiers`, `"Main Event"`, `Semi-Finals` or `Finals`) is sent with every match and decides its phase and ban count in the app (6 bans in the Qualifiers, 8 after). Without it the Feed card's phase applies. Reposting a match with the right `--phase` corrects one that landed under the wrong phase.
 
-Outside the Qualifiers (any other `--phase`), every team is known in advance, so team names are best-fit to the tournament's own spelling before they are stored and sent. That covers names the overlay cuts off (`XQTY`, `34-YRS-OLD MEN`), shortens (`THE BLUE.`) or misreads (`UNC KAPELLE`). The known teams come from `--teams FILE` (default `data/known_teams.txt`, AT XXII). The file has one team per line with optional `| alias` entries, or it can be a tournament JSON with a `teams` list. Without `--phase`, or with `Qualifiers`, names are kept as read.
+Outside the Qualifiers (any other `--phase`), every team is known in advance, so team names are best-fit to the tournament's own spelling before they are stored and sent. That covers names the overlay cuts off (`XQTY`, `34-YRS-OLD MEN`), shortens (`THE BLUE.`) or misreads (`UNC KAPELLE`). The known teams come from `--teams FILE` (default `data/known_teams.txt`, AT XXII). The file has one team per line with optional `| alias` entries, or it can be a tournament JSON with a `teams` list (the aliases in `data/known_teams.txt` still apply to its teams, e.g. "EEE" for the IIII team). Without `--phase`, or with `Qualifiers`, names are kept as read.
 
 Matches are numbered within their phase, in the order they go live (abandoned matches get no number), and that number is the `match_id` sent. The numbering continues from the highest number already in `--db` for that phase, so one database used every day keeps the prelims counting up across days. A day in its own database starts from `--first-match N` (e.g. `--first-match 35` when day 1 ended on match 34). The site builder labels matches the same way, counting on across the days it is given.
 
@@ -76,7 +76,7 @@ env/bin/stream-tracker live eveonline --db at.sqlite --zkill
 
 Killmails come from zKillboard's region 10000004 (UUA-F4, `--region`), with names from ESI. They are cached in a `killmails` table, so re-runs only fetch what's new. Each death is linked to the killmail with the same ship type and a similar pilot name (allowing for OCR slips and `…` truncation) that is **closest in time**, so a pilot who dies in several matches that day gets the right kill each time. A death whose closest killmail is still more than `--tolerance` seconds off stays unlinked. Not every AT kill reaches zKill (none of AT XXII's earlier days did).
 
-`died_utc` trails the game by the stream delay (live), or by the error in `--start-utc` (replay). The tracker estimates that offset per match, from the kill−death time most deaths agree on, before pairing. The `zkill` command prints it, and `--offset` overrides it. A death seen after the HUD was off screen (`gap_before_s`) may match a kill up to that much earlier. A killmail links to one ship only. An `unknown_time` death links only when exactly one candidate falls inside its match.
+`died_utc` trails the game by the stream delay (live), or by the error in `--start-utc` (replay). The tracker estimates that offset per match, from the kill−death time most deaths agree on, before pairing. The `zkill` command prints it, and `--offset` overrides it. A death seen after the HUD was off screen (`gap_before_s`) may match a kill up to that much earlier. A killmail links to one ship only. A death whose pilot name is unreadable (the "IIIIIIIIII ll" pilot read as "TTT") links on ship type and time alone, when exactly one killmail of that ship is within 5s. An `unknown_time` death links only when exactly one candidate falls inside its match.
 
 Linked ships get `killmail_id`, `killmail_hash`, `killmail_utc`, `killmail_delta_s` (error after the offset) and `zkill_victim`. The kill is at `https://zkillboard.com/kill/<killmail_id>/`. Each run logs a `zkill` event per match. None of this is sent with `--post`.
 
@@ -102,10 +102,10 @@ If a `hud_lost` match comes back with the same teams and the clock still countin
 **Time dilation:** the white clock counts real time. Under heavy TiDi the game runs slower, so when the white clock hits 0:00 the HUD switches to a red `m:ss TiDi:nnn%` clock with the game time still left, and play continues. The tracker follows that red clock (read by tesseract, since its font differs) and records the extra time as `tidi_overtime_s`. With mild TiDi, ships can still die a few seconds after 0:00 without a red clock appearing, so a `time` ending waits 10 frames after 0:00 before closing (`ended_utc` is still the first 0:00).
 
 Death times:
-- `died_match_s`: real seconds since the match went live (can exceed 600 with TiDi).
+- `died_match_s`: real seconds since the match went live (can exceed 600 with TiDi), less 4s: a row greys out about 4s after the ship dies (AT XXII finals, against the official death times).
 - `died_clock_s`: the clock the HUD showed.
 - `died_in_tidi`: 1 if that was the red TiDi clock.
-- `died_utc` and `died_stream_offset_s`: absolute and stream time.
+- `died_utc` and `died_stream_offset_s`: absolute and stream time of the frame where the row greyed.
 
 **Things the tracker works around:**
 - **Look-alike ads:** overlay shown for under 25s is dropped, and a mid-match overlay with other teams or an inconsistent clock is ignored for up to 25s. Longer ads replay a match clip that starts mid-clock and cuts away: a match never seen counting down whose HUD is lost within 2 minutes is dropped too (AT XXI day 3, 7:31:44 and 8:10:46). Real matches the broadcast cut away from had their countdown and ran 5+ minutes.
@@ -113,22 +113,23 @@ Death times:
 - **Faded or dimmed overlay:** alive/dead is judged relative to the column headings' brightness.
 - **Stale overlay showing both teams wiped:** ignored.
 - **Team names changed mid-match:** the match is recognised by its rosters' points.
-- **Frozen or stalled picture:** a clock that stops, or falls behind wall time after the feed stalls, is re-anchored as long as the rosters match. It doesn't end the match. A clock that jumps back up is still taken for a clip. (AT XXII Finals day 1: the picture froze for ~30s, and the match was ended and reopened every 30s.)
+- **Frozen or stalled picture:** a clock that stops, or falls behind wall time after the feed stalls, is re-anchored as long as the rosters match. It doesn't end the match. A clock that jumps back up is still taken for a clip. (AT XXII Finals day 1: the picture froze for ~30s, and the match was ended and reopened every 30s.) Deaths that show when the picture unfreezes get the freeze's length as `gap_before_s`, since they happened at some point during it. The live start is dated from the first frame whose clock has moved, so a clock frozen when tracking joins doesn't skew it (AT XXII finals day 1: stuck on 9:53 for 7s, then 9:31).
 - **Noise in the ban list:** the HUD can show more ban rows than there are bans. A read that matches no ship is kept only if it looks like a name (1–3 words of letters, one of them 4+ letters long). Specks ("_ Dapier") and 7-for-Z ("7arma7d") are cleaned before matching.
 - **Wrong team on the overlay** (outside the Qualifiers): when a side's pilots fielded for another team earlier in `--db`, that team is used in two cases: the overlay swapped the two names, or its name fits no known team (the IIII team read as "SUMUUOUIOUNNNNNNOTIME"). Logged as `team_from_pilots`.
 - **Draft panel misreads:** the panel's team names are compared after both are fitted to the known teams ("Rote Kapalla"). HUD bans that match no ship don't count against a draft.
 - **Ban counts in the Finals:** drafts had 8–12 bans (up to 6 a side). The tracker sends whatever the panel shows.
 - **Pilot names spilling into the PTS column.**
+- **Slashed zeros in pilot names:** read as e, @, a, o or 8 after a digit ("psilon2ee@", "shyt38aa") and put back to 0. A name of only I's and l's (read as "TTT") is spelled out from its bars.
 - **In-game labels showing just above the timer.**
 
 **Final scores** are taken as 200 minus the opponent's surviving points whenever every roster PTS was read, since the score digits can stop reading cleanly on a soft encode (AT XXI day 3 on YouTube). A disagreement with the last score read is logged as a `score_mismatch` event.
 
 **Bans** not in the ship list (e.g. Cenotaph in AT XXI) are kept as raw text with `ship_type = NULL`; the rest of that side's bans still resolve.
 
-**Ban order:** the HUD's "Ship Bans" lists aren't in pick order. Before each match the broadcast shows a draft panel with the bans in pick order, plus both team names. The tracker reads that panel while it is on screen, until 3 reads agree (it starts over if more cards appear, since the panel can fill in pick by pick). It then uses the panel for the next match within 30 minutes whose team names match it (sides are matched by name, not colour). Because HUD names can be misread ("UNC KAPELLE") or stale (the previous match's teams), the panel is also used when one name matches, or none does, as long as its banned ships agree with the HUD's (allowing one ship read wrong). When the panel and the HUD disagree on a single ship for a side, the read that matches the ship list better is kept, in the panel's position. In that case:
-- `bans.ordinal` follows pick order within each side;
+**Ban order:** the HUD's "Ship Bans" lists aren't in pick order. Before each match the broadcast shows a draft panel with the bans in pick order, plus both team names. The tracker reads that panel while it is on screen, until 3 reads agree (it starts over if more cards appear, since the panel can fill in pick by pick). It then uses the panel for the next match within 30 minutes whose team names match it (sides are matched by name, not colour). Because HUD names can be misread ("UNC KAPELLE") or stale (the previous match's teams), the panel is also used when one name matches, or none does, as long as its banned ships agree with the HUD's (allowing one ship read wrong). The panel's picks keep their order, and any HUD ships the panel lacks follow them with `pick = NULL`: the broadcast can cut away before every pick is in (AT XXII finals: 3 of 12 cards shown), and series conquest bans appear on the HUD only. When a panel ship looks like a HUD ship the panel lacks ("Rapler"/"Rapier", "Fos"/"Eos", a cut-off "nageddon N:"), it is one ship misread by one of them, and whichever ship fits both reads better is kept, in the panel's position. The panel's font reads i as l, so "Rapler" is taken as Rapier even without a HUD read. In that case:
+- `bans.ordinal` follows pick order within each side, then the HUD-only bans;
 - `bans.pick` is the overall pick number across both sides (1..N);
-- a `bans_from_draft` event is logged, plus `draft_ban_mismatch` if a side's ships differ from the HUD's list (the panel still wins).
+- a `bans_from_draft` event is logged, plus `draft_ban_mismatch` (with the merged list) if a side's ships differ from the HUD's list.
 
 If no matching panel was seen (e.g. the stream joined late, or an old `--save-hud` cache that didn't keep panel frames), the bans come from the HUD as before, top to bottom, with `pick = NULL`.
 

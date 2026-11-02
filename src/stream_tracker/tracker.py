@@ -15,6 +15,7 @@ still remaining, and play continues.
 
 import json
 import logging
+import re
 from collections import Counter
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
@@ -39,10 +40,16 @@ TEAM_POINTS = 200  # a team's score is 200 minus the opponent's surviving points
 HUD_ON_FRAMES = 3  # consecutive HUD frames before a match is opened
 HUD_OFF_FRAMES = 3  # consecutive non-HUD frames before an ended match is let go
 DEATH_FRAMES = 2  # consecutive dead frames before a death is recorded
+# A row greys out this long after the ship died, by the match clock. Measured
+# against the AT XXII finals' official death times (day 1, 347 deaths: the
+# grey-out trailed by 3-5s in every match, median 4s). Taken off died_match_s
+# only; died_utc and died_stream_offset_s stay the frame the row greyed.
+DEATH_DISPLAY_LAG_S = 4
+FROZEN_MIN_S = 3  # the clock seen showing one value for this long is a frozen picture
 # After the clock reaches 0:00, wait this long for a TiDi clock to appear
 # before ending the match (the end time is still the first 0:00).
 ZERO_HOLD_FRAMES = 10
-LIVE_CONFIRM_FRAMES = 2  # running-clock readings before the 10:00 timer counts as started
+LIVE_STUCK_MAX_S = 30  # a white clock that hasn't moved in this long starts the match anyway
 IDENTITY_VOTES = 3  # agreeing reads before a name is settled
 IDENTITY_MAX_READS = 20
 UNMATCHED = "?"  # prefixes raw ban text that isn't in the ship list, in votes
@@ -68,6 +75,7 @@ CLOCK_TOLERANCE_S = 3
 DRAFT_MAX_AGE_S = 1800
 DRAFT_GAP_S = 60
 DRAFT_MIN_BANS_TO_AGREE = 3  # fewer bans than this say too little to recognise a match by
+BAN_MISREAD_MIN = 60  # name similarity of a draft ship and a HUD ship taken for one misread
 OTHER = {"red": "blue", "blue": "red"}
 
 
@@ -97,6 +105,11 @@ def same_team(a: str | None, b: str | None) -> bool:
     if fuzz.ratio(a, b) >= TEAM_SNAP_SCORE:
         return True
     return min(len(a), len(b)) >= 4 and fuzz.partial_ratio(a, b) >= 95
+
+
+def _letters(text: str) -> str:
+    """Lower-case letters and spaces of an OCR read, without edge specks."""
+    return re.sub(r"[^a-z ]", "", text.lower()).strip()
 
 
 def iso(t: datetime) -> str:
@@ -158,6 +171,10 @@ class MatchState:
     live_candidates: list = field(default_factory=list)  # (FrameTime, clock) before live_started
     last_clock: int | None = None
     last_clock_t: FrameTime | None = None
+    # The white clock's value and the first and last frames seen showing it.
+    # Unlike last_clock it isn't moved by re-anchoring, so a frozen clock
+    # shows how long it froze.
+    clock_shown: tuple[int, FrameTime, FrameTime] | None = None
     hud_frames: int = 0
     foreign_streak: int = 0
     last_hud: FrameTime | None = None
@@ -326,14 +343,31 @@ class Tracker:
             m = self._open(frame, t)
 
         gap = (t.offset - m.last_hud.offset) if m.last_hud else 0.0
+        gap = gap if gap > 2 else 0.0
+        frozen = self._frozen_for(r, t)
         m.last_hud = t
         m.hud_frames += 1
         self._last_hud = (frame, r)
         self._maybe_read_identity(frame, r)
         self._update_phase(r, t)
-        self._update_slots(r, t, gap if gap > 2 else 0.0)
+        self._update_slots(r, t, max(gap, frozen))
         self._check_scores(r, t)
         self._check_end(r, t)
+
+    def _frozen_for(self, r: FrameReading, t: FrameTime) -> float:
+        """How long the picture was frozen before this frame, judged by the
+        white clock: it ticks every second, so one that showed the same value
+        for longer and has now moved on was a frozen picture (AT XXII finals
+        day 1: ~20s). Deaths seen as it unfreezes happened during the freeze,
+        so this counts as time the HUD was off screen. 0 otherwise."""
+        m = self.match
+        if (not m.live_started or r.phase != Phase.LIVE or r.tidi or r.clock is None
+                or m.clock_shown is None or r.clock >= m.clock_shown[0]):
+            return 0.0
+        _, first, last = m.clock_shown
+        if last.offset - first.offset < FROZEN_MIN_S:
+            return 0.0  # ticking normally (or unreadable for a while, which isn't a freeze)
+        return t.offset - first.offset - 1
 
     def _same_roster(self, m: MatchState, r: FrameReading) -> bool:
         """Do this frame's PTS columns match the rosters seen so far?"""
@@ -518,12 +552,22 @@ class Tracker:
         if not m.live_started and r.phase == Phase.LIVE and r.clock:
             # The countdown's last 0:00 can render white, and a stray read
             # shouldn't start the match, so wait for a running clock.
-            m.live_candidates = [(ct, c) for ct, c in m.live_candidates if c >= r.clock][-5:]
+            m.live_candidates = [(ct, c) for ct, c in m.live_candidates
+                                 if c >= r.clock and t.offset - ct.offset <= LIVE_STUCK_MAX_S]
             m.live_candidates.append((t, r.clock))
-            if len(m.live_candidates) >= LIVE_CONFIRM_FRAMES:
-                first_t, first_clock = m.live_candidates[0]
+            # Date the start from the first frame whose clock had just moved.
+            # A clock still showing its first value may be a frozen picture:
+            # AT XXII finals day 1, a joined-late match sat on 9:53 for 7s and
+            # then showed 9:31, so dating from the 9:53 put the start 9s late.
+            moved = next((i for i in range(1, len(m.live_candidates))
+                          if m.live_candidates[i][1] < m.live_candidates[i - 1][1]), None)
+            if moved is None and t.offset - m.live_candidates[0][0].offset >= LIVE_STUCK_MAX_S:
+                moved = 0  # a clock that never moves (paused): date it from when it was first seen
+            if moved is not None:
+                first_t, first_clock = m.live_candidates[moved]
                 m.live_started = True
                 m.last_clock, m.last_clock_t = r.clock, t
+                m.clock_shown = (r.clock, t, t)
                 m.live_start_offset = first_t.offset - (MATCH_LENGTH_S - first_clock)
                 start = first_t.utc - timedelta(seconds=MATCH_LENGTH_S - first_clock)
                 late = not m.saw_countdown
@@ -537,6 +581,10 @@ class Tracker:
         if r.phase in (Phase.PRE, Phase.COUNTDOWN, Phase.LIVE):
             m.phase = r.phase
         if m.live_started and r.phase == Phase.LIVE and r.clock is not None:
+            if m.clock_shown is None or r.clock != m.clock_shown[0]:
+                m.clock_shown = (r.clock, t, t)
+            else:
+                m.clock_shown = (r.clock, m.clock_shown[1], t)
             m.last_clock, m.last_clock_t = r.clock, t
 
     def _update_tidi(self, r: FrameReading, t: FrameTime) -> None:
@@ -609,7 +657,7 @@ class Tracker:
         else:
             died_match_s = None
             if m.live_start_offset is not None:
-                died_match_s = round(t.offset - m.live_start_offset)
+                died_match_s = max(0, round(t.offset - m.live_start_offset - DEATH_DISPLAY_LAG_S))
             s.death_confidence = "high" if self._score_agrees(s.side, r) else "low"
             fields = dict(
                 died_match_s=died_match_s,
@@ -805,8 +853,10 @@ class Tracker:
             picks = None
             if drafted is not None:
                 hud_bans = bans
-                bans = self._reconcile_bans([(raw, typ) for s, raw, typ, _ in drafted if s == side], hud_bans)
-                picks = [pick for s, _, _, pick in drafted if s == side]
+                merged = self._reconcile_bans([(raw, typ, pick) for s, raw, typ, pick in drafted if s == side],
+                                              hud_bans)
+                bans = [(raw, typ) for raw, typ, _ in merged]
+                picks = [pick for _, _, pick in merged]
                 if sorted(typ or raw for raw, typ in bans) != sorted(typ or raw for raw, typ in hud_bans):
                     self._log(m, *self._now(), "draft_ban_mismatch",
                               {"side": side, "draft": [list(b) for b in bans],
@@ -911,8 +961,12 @@ class Tracker:
         # the raw text still agree; team names vote on their own.
         bans = []
         for side, raw in read.bans:
-            hit = self.vocab.match(raw).ship
-            bans.append((side, raw, hit.name if hit else None))
+            hit = self.vocab.match(raw)
+            # The panel's font reads i as l: "Rapler" ties Reaper and Rapier.
+            alt = self.vocab.match(raw.replace("l", "i"))
+            if alt.score > hit.score:
+                hit = alt
+            bans.append((side, raw, hit.ship.name if hit.ship else None))
         key = ("bans", tuple((side, typ or UNMATCHED + raw) for side, raw, typ in bans))
         self._draft_votes[key] += 1
         for side in SIDES:
@@ -968,25 +1022,53 @@ class Tracker:
         self._log(m, *self._now(), "bans_from_draft", {"bans": [list(b) for b in m.draft_bans]})
         return m.draft_bans
 
-    def _reconcile_bans(self, drafted: list[tuple[str, str | None]],
-                        hud: list[tuple[str, str | None]]) -> list[tuple[str, str | None]]:
-        """Draft bans, with one ship the HUD read more clearly swapped in.
+    def _reconcile_bans(self, drafted: list[tuple[str, str | None, int | None]],
+                        hud: list[tuple[str, str | None]]) -> list[tuple[str, str | None, int | None]]:
+        """One side's bans as (raw, type, pick): the draft's in pick order,
+        then the HUD's that the draft lacks.
 
-        When the two lists differ by a single ship, one of them misread it
-        ("Rapler" on the panel resolving to Reaper, or "?agu" on the HUD), so
-        the read that matches the ship list better wins, in the draft's place.
+        The broadcast can cut away from the panel before every pick is in
+        (AT XXII finals: 3 of 12 cards shown), and series "conquest" bans
+        are on the HUD only, so HUD ships missing from the draft are kept,
+        after the drafted ones, with no pick number. HUD reads that matched
+        no ship are noise more often than not and aren't added.
+
+        A draft ship the HUD lacks that looks like one the HUD has instead
+        is one ship that one of them misread: "Rapler" (-> Reaper) on the
+        panel and "; Dapier" (-> Rapier) on the HUD, "Fos" or a cut-off
+        "nageddon N:" on the panel. Of the two ships, the one closer to both
+        raw reads together is kept, in the draft's place; on a tie the
+        draft's.
         """
-        names = lambda bans: Counter(typ or raw for raw, typ in bans)
-        only_draft = names(drafted) - names(hud)
-        only_hud = names(hud) - names(drafted)
-        if sum(only_draft.values()) != 1 or sum(only_hud.values()) != 1:
-            return drafted
-        i = next(i for i, (raw, typ) in enumerate(drafted) if (typ or raw) in only_draft)
-        h = next(b for b in hud if (b[1] or b[0]) in only_hud)
-        score = lambda b: self.vocab.match(b[0]).score if b[1] else 0.0
-        if score(h) > score(drafted[i]):
-            drafted = drafted[:i] + [h] + drafted[i + 1:]
-        return drafted
+        name = lambda b: b[1] or b[0]
+        merged = list(drafted)
+        only_hud = list((Counter(map(name, hud)) - Counter(map(name, drafted))).elements())
+        only_draft = Counter(map(name, drafted)) - Counter(map(name, hud))
+        raw_of = {name(b): b for b in drafted}
+
+        def similar(d: str, h: str) -> float:
+            sim = fuzz.ratio(d.lower(), h.lower())
+            if raw_of[d][1] is None and len(_letters(d)) >= 5:
+                sim = max(sim, fuzz.partial_ratio(_letters(d), h.lower()))  # a cut-off read
+            return sim
+
+        pairs = sorted(((similar(d, h), d, h) for d in only_draft for h in set(only_hud)), reverse=True)
+        for sim, d, h in pairs:
+            if sim < BAN_MISREAD_MIN or only_draft[d] == 0 or h not in only_hud:
+                continue
+            i = next(i for i, b in enumerate(merged) if name(b) == d)
+            hb = next(b for b in hud if name(b) == h)
+            reads = (_letters(merged[i][0]), _letters(hb[0]))
+            fit = lambda ship: sum(fuzz.ratio(r, ship.lower()) for r in reads) if ship else -1.0
+            if fit(hb[1]) > fit(merged[i][1]):
+                merged[i] = (hb[0], hb[1], merged[i][2])
+            only_draft[d] -= 1
+            only_hud.remove(h)
+        for b in hud:
+            if b[1] and name(b) in only_hud:
+                only_hud.remove(name(b))
+                merged.append((b[0], b[1], None))
+        return merged
 
     def _same_known_team(self, a: str | None, b: str | None) -> bool:
         """same_team, or (outside the Qualifiers) both names best-fit to the

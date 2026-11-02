@@ -201,8 +201,16 @@ class KnownTeams:
     @classmethod
     def from_file(cls, path: Path = KNOWN_TEAMS_FILE) -> "KnownTeams":
         if path.suffix == ".json":
+            # A tournament JSON has no aliases; those in the default file
+            # still apply to its teams ("EEE" for the IIII… team).
             import json
-            return cls([t["name"] for t in json.loads(path.read_text())["teams"]])
+            names = [t["name"] for t in json.loads(path.read_text())["teams"]]
+            _, aliases = cls._read_list(KNOWN_TEAMS_FILE) if KNOWN_TEAMS_FILE.exists() else ([], {})
+            return cls(names, {a: n for a, n in aliases.items() if n in names})
+        return cls(*cls._read_list(path))
+
+    @staticmethod
+    def _read_list(path: Path) -> tuple[list[str], dict[str, str]]:
         names, aliases = [], {}
         for line in path.read_text().splitlines():
             if not line.strip() or line.lstrip().startswith("#"):
@@ -210,7 +218,7 @@ class KnownTeams:
             name, *alts = (part.strip() for part in line.split("|"))
             names.append(name)
             aliases.update({a: name for a in alts if a})
-        return cls(names, aliases)
+        return names, aliases
 
     def score(self, name: str, known: str) -> float:
         squashed, words = "".join(_team_words(name)), " ".join(_team_words(name))

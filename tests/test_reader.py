@@ -150,3 +150,18 @@ def _strip(name):
 def test_tidi_clock(name, clock, tidi):
     r = reader.read_frame(_strip(name))
     assert (r.phase, r.clock, r.tidi) == (Phase.LIVE, clock, tidi)
+
+
+@pytest.mark.parametrize("raw, fixed", [
+    # AT XXII finals: the HUD's slashed zero in pilot names
+    ("psilon2ee@", "psilon2000"),
+    ("psilon2eee", "psilon2000"),
+    ("shyt38aa", "shyt3000"),
+    # left alone
+    ("pilot38", "pilot38"),
+    ("2each", "2each"),
+    ("KitCat 01", "KitCat 01"),
+    ("Hazairthy The Seco…", "Hazairthy The Seco…"),
+])
+def test_slashed_zeros_in_pilot_names(raw, fixed):
+    assert reader.fix_slashed_zeros(raw) == fixed

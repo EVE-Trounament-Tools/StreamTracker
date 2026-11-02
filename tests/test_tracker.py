@@ -9,7 +9,7 @@ import numpy as np
 from stream_tracker import reader
 from stream_tracker.db import Database
 from stream_tracker.reader import Identity
-from stream_tracker.tracker import (MIN_LATE_JOIN_HUD_FRAMES, MIN_MATCH_HUD_FRAMES, FrameTime, MatchState,
+from stream_tracker.tracker import (DEATH_DISPLAY_LAG_S, LIVE_STUCK_MAX_S, MIN_LATE_JOIN_HUD_FRAMES, MIN_MATCH_HUD_FRAMES, FrameTime, MatchState,
                                    Tracker)
 from stream_tracker.vocab import ShipVocab, load_ships
 
@@ -55,7 +55,8 @@ def test_match_lifecycle(frame, tmp_path):
     dead = {(s["side"], s["slot"]) for s in ships if s["died_utc"]}
     assert dead == {("red", i) for i in (2, 3, 4, 5, 6, 7, 8, 9)} | {("blue", i) for i in (0, 2, 3, 4)}
     first_seen = [s for s in ships if s["side"] == "blue" and s["slot"] == 0][0]
-    assert first_seen["died_match_s"] == 600 - 246  # first seen dead at 4:06
+    # First seen dead at 4:06; the row greys out DEATH_DISPLAY_LAG_S after the death.
+    assert first_seen["died_match_s"] == 600 - 246 - DEATH_DISPLAY_LAG_S
     bans = rows(db_path, "SELECT ship_type FROM bans WHERE side='red' ORDER BY ordinal")
     assert [b["ship_type"] for b in bans] == ["Zarmazd", "Ashimmu", "Curse"]
     # Points are the PTS column read off the stream.
@@ -66,7 +67,9 @@ def test_match_lifecycle(frame, tmp_path):
 def test_joined_late(frame, tmp_path):
     db_path = tmp_path / "t.sqlite"
     tracker = Tracker(Database(db_path))
-    feed(tracker, [(1000 + i, frame(1000)) for i in range(6)])
+    # A still frame's clock never moves, so it counts as live once it has
+    # been up LIVE_STUCK_MAX_S (a moving clock starts it sooner).
+    feed(tracker, [(1000 + i, frame(1000)) for i in range(LIVE_STUCK_MAX_S + 6)])
     tracker.close()
     (m,) = rows(db_path, "SELECT * FROM matches")
     assert m["joined_late"] == 1 and m["status"] == "live"
@@ -553,6 +556,57 @@ def test_clearer_read_wins_a_one_ship_disagreement(monkeypatch, tmp_path):
         tracker._vote(m, _identity(red_bans=("Huginn", "Rapier"), blue_bans=("?agu", "Eos")))
     bans = rows(db_path, "SELECT ship_type, pick FROM bans ORDER BY pick")
     assert [(b["ship_type"], b["pick"]) for b in bans] == [("Rapier", 1), ("Magus", 2), ("Huginn", 3), ("Eos", 4)]
+
+
+def test_partial_draft_keeps_the_huds_other_bans(monkeypatch, tmp_path):
+    """AT XXII finals day 2 (233 g2): the broadcast cut away after 3 picks.
+    The panel's picks keep their order; the HUD's other bans follow, unpicked."""
+    db_path, tracker, m = _hand_match(tmp_path)
+    _fake_draft(monkeypatch, red="THE TUSKERS CO.", blue="META RELOADED",
+                bans=[("red", "Eos"), ("blue", "Arbitrator"), ("blue", "Curse")])
+    _see_draft(tracker)
+    for _ in range(3):
+        tracker._vote(m, _identity(red_bans=("Astarte", "Eos", "Ashimmu"),
+                                   blue_bans=("Sleipnir", "Arbitrator", "Noacon")))
+    bans = rows(db_path, "SELECT side, ship_type, pick FROM bans ORDER BY side DESC, ordinal")
+    assert [(b["side"], b["ship_type"], b["pick"]) for b in bans] == [
+        ("red", "Eos", 1), ("red", "Astarte", None), ("red", "Ashimmu", None),
+        ("blue", "Arbitrator", 2), ("blue", "Curse", 3), ("blue", "Sleipnir", None)]
+
+
+def test_panel_fos_gives_way_to_hud_eos(monkeypatch, tmp_path):
+    """The panel reads Eos as "Fos" (no ship); the HUD's Eos takes its place."""
+    db_path, tracker, m = _hand_match(tmp_path)
+    _fake_draft(monkeypatch, red="THE TUSKERS CO.", blue="META RELOADED",
+                bans=[("red", "Fos"), ("blue", "Maulus"), ("red", "Zarmazd"), ("blue", "Rapler")])
+    _see_draft(tracker)
+    for _ in range(3):
+        tracker._vote(m, _identity(red_bans=("Zarmazd", "Eos"), blue_bans=("Rapier", "Maulus")))
+    bans = rows(db_path, "SELECT ship_type, pick FROM bans ORDER BY pick")
+    assert [(b["ship_type"], b["pick"]) for b in bans] == [("Eos", 1), ("Maulus", 2), ("Zarmazd", 3), ("Rapier", 4)]
+
+
+def test_misreads_on_both_sides_resolve_to_the_ship_both_fit(monkeypatch, tmp_path):
+    """AT XXII finals day 1: panel "Rapler" (-> Reaper), HUD "; Dapier" (-> Rapier),
+    and a cut-off panel card "nageddon N:" for the HUD's Armageddon Navy Issue."""
+    db_path, tracker, m = _hand_match(tmp_path)
+    _fake_draft(monkeypatch, red="THE TUSKERS CO.", blue="META RELOADED",
+                bans=[("red", "Huginn"), ("blue", "nageddon N:"), ("red", "Rapler"), ("blue", "Maulus")])
+    _see_draft(tracker)
+    for _ in range(3):
+        tracker._vote(m, _identity(red_bans=("; Dapier", "Huginn"), blue_bans=("Maulus", "Armageddon Navy Issue")))
+    bans = rows(db_path, "SELECT ship_type, pick FROM bans ORDER BY pick")
+    assert [(b["ship_type"], b["pick"]) for b in bans] == [
+        ("Huginn", 1), ("Armageddon Navy Issue", 2), ("Rapier", 3), ("Maulus", 4)]
+
+
+def test_panel_reads_i_as_l(monkeypatch, tmp_path):
+    """"Rapler" on the panel is Rapier, even with no HUD read to settle it."""
+    db_path, tracker, m = _hand_match(tmp_path)
+    _fake_draft(monkeypatch, red="THE TUSKERS CO.", blue="META RELOADED",
+                bans=[("red", "Rapler"), ("blue", "Maulus"), ("red", "Huginn"), ("blue", "Sleipnir")])
+    _see_draft(tracker)
+    assert [typ for _, _, typ in tracker.draft.bans] == ["Rapier", "Maulus", "Huginn", "Sleipnir"]
 
 
 @pytest.mark.parametrize("phase, stored", [

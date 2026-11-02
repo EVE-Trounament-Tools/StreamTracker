@@ -108,6 +108,16 @@ def test_known_teams_from_tournament_json(tmp_path):
     assert KnownTeams.from_file(path).fit("SEKER MATAR") == "Seker Matar"
 
 
+def test_tournament_json_keeps_default_aliases(tmp_path):
+    """The JSON has no aliases; data/known_teams.txt's still apply (AT XXII
+    finals: the IIII… team read as "EEE")."""
+    from stream_tracker.vocab import KnownTeams
+
+    path = tmp_path / "t.json"
+    path.write_text('{"teams": [{"name": "IIIIIIIIIIIIIIIIIIIIIIIIIII"}, {"name": "Seker Matar"}]}')
+    assert KnownTeams.from_file(path).fit("EEE") == "IIIIIIIIIIIIIIIIIIIIIIIIIII"
+
+
 @pytest.mark.parametrize("raw, expected", [
     # AT XXII finals day 1: ban rows read over the game scene
     ("_ Dapier", "Rapier"),
